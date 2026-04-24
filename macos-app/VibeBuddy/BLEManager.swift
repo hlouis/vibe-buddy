@@ -229,6 +229,22 @@ extension BLEController: CBPeripheralDelegate {
         }
         if line.contains("\"type\":\"audio\"") {
             audio.handleControl(line)
+            return
+        }
+        if line.contains("\"type\":\"edit\"") {
+            handleEditLine(line)
+            return
+        }
+    }
+
+    private func handleEditLine(_ line: String) {
+        guard let action = extractString(from: line, key: "action") else { return }
+        NSLog("[edit] %@", action)
+        switch action {
+        case "newline":   audio.injector.sendEnter()
+        case "backspace": audio.injector.sendBackspaceChar()
+        case "clear":     audio.injector.clearAll()
+        default:          NSLog("[edit] unknown action: %@", action)
         }
     }
 

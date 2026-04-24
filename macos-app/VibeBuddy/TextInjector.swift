@@ -73,6 +73,43 @@ final class TextInjector {
         injectedText = ""
     }
 
+    // MARK: hardware-button edit actions
+
+    @MainActor
+    func sendEnter() {
+        guard checkPermission() else { onPermissionRequired?(); return }
+        // Cursor moved to a new line — the previous injection mirror no
+        // longer maps onto the current field contents, so start fresh.
+        injectedText = ""
+        typingQueue.async { [weak self] in
+            self?.postKey(0x24)   // kVK_Return
+        }
+    }
+
+    @MainActor
+    func sendBackspaceChar() {
+        guard checkPermission() else { onPermissionRequired?(); return }
+        if !injectedText.isEmpty {
+            injectedText = String(injectedText.dropLast())
+        }
+        typingQueue.async { [weak self] in
+            self?.sendBackspace()
+        }
+    }
+
+    // Cmd+A then delete. Wipes the ENTIRE focused field, not just the
+    // text we injected — user asked for "clear all" semantics.
+    @MainActor
+    func clearAll() {
+        guard checkPermission() else { onPermissionRequired?(); return }
+        injectedText = ""
+        typingQueue.async { [weak self] in
+            self?.sendSelectAll()
+            Thread.sleep(forTimeInterval: 0.020)
+            self?.sendBackspace()
+        }
+    }
+
     // Rollback when a session is cancelled: backspace out everything we
     // injected so the target app is clean.
     @MainActor
@@ -91,13 +128,34 @@ final class TextInjector {
     // MARK: CGEvent plumbing (background queue)
 
     private func sendBackspace() {
-        let vkDelete: CGKeyCode = 0x33
-        let down = CGEvent(keyboardEventSource: eventSource, virtualKey: vkDelete, keyDown: true)
-        let up = CGEvent(keyboardEventSource: eventSource, virtualKey: vkDelete, keyDown: false)
-        down?.post(tap: .cghidEventTap)
+        postKey(0x33)   // kVK_Delete
+    }
+
+    private func postKey(_ keyCode: CGKeyCode) {
+        guard let down = CGEvent(keyboardEventSource: eventSource,
+                                 virtualKey: keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: eventSource,
+                               virtualKey: keyCode, keyDown: false)
+        else { return }
+        down.post(tap: .cghidEventTap)
         Thread.sleep(forTimeInterval: 0.002)
-        up?.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
         Thread.sleep(forTimeInterval: 0.002)
+    }
+
+    private func sendSelectAll() {
+        let vkA: CGKeyCode = 0x00   // 'a'
+        guard let down = CGEvent(keyboardEventSource: eventSource,
+                                 virtualKey: vkA, keyDown: true),
+              let up = CGEvent(keyboardEventSource: eventSource,
+                               virtualKey: vkA, keyDown: false)
+        else { return }
+        down.flags = .maskCommand
+        up.flags = .maskCommand
+        down.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.003)
+        up.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.003)
     }
 
     // Use UnicodeString injection so we never translate through a
