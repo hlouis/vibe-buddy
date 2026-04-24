@@ -1,0 +1,28 @@
+# PlatformIO
+firmware/.pio/
+firmware/.vscode/
+firmware/.cache/
+
+# Xcode — xcodeproj is generated from project.yml via xcodegen
+macos-app/build/
+macos-app/DerivedData/
+macos-app/*.xcodeproj/
+**/*.xcuserdata/
+**/xcuserdata/
+**/*.xcworkspace/xcuserdata/
+
+# macOS
+.DS_Store
+
+# Secrets / local config
+config.json
+.env
+
+# Python venv for tools/
+tools/.venv/
+__pycache__/
+
+# Test-run audio dumps
+out.pcm
+out.wav
+louder.wav
