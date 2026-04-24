@@ -2,8 +2,8 @@ import Foundation
 import Combine
 
 // AppState is the single source of truth for the UI. Everything the view
-// renders reads from here. The BLEController mutates these on the main
-// actor as events arrive off CoreBluetooth's callback queue.
+// renders reads from here. BLEController + AudioStreamer mutate these on
+// the main actor as events arrive off CoreBluetooth / STT callback queues.
 @MainActor
 final class AppState: ObservableObject {
     enum LinkStatus: Equatable {
@@ -33,9 +33,13 @@ final class AppState: ObservableObject {
     @Published var session: AudioSession? = nil
     @Published var totalSessions: Int = 0
     @Published var bluetoothPoweredOn: Bool = false
-
-    // Last PCM file path we dumped a session to. Step 5 just writes to
-    // disk so we can verify parity with the Python dumper; step 6 swaps
-    // this out for the streaming ASR pipeline.
     @Published var lastDumpPath: String? = nil
+
+    // ASR / injection state
+    @Published var sttStatus: String = "idle"
+    @Published var partialText: String = ""
+    @Published var finalText: String = ""
+    @Published var asrError: String = ""
+    @Published var accessibilityTrusted: Bool = false
+    @Published var configMissing: Bool = false
 }

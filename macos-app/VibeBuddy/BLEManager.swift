@@ -42,6 +42,26 @@ final class BLEController: NSObject, ObservableObject {
         audio.onSessionEnded = { [weak state] in
             state?.totalSessions += 1
         }
+        audio.onASRStatus = { [weak state] s in
+            state?.sttStatus = s
+        }
+        audio.onPartialText = { [weak state] t in
+            state?.partialText = t
+        }
+        audio.onFinalText = { [weak state] t in
+            state?.finalText = t
+            state?.partialText = ""
+        }
+        audio.onASRError = { [weak state] msg in
+            state?.asrError = msg
+        }
+        audio.onPermissionRequired = { [weak state] in
+            state?.accessibilityTrusted = false
+        }
+
+        // Surface boot-time config and permission state to the UI.
+        state.configMissing = (Config.load() == nil)
+        state.accessibilityTrusted = audio.injector.checkPermission()
     }
 
     // MARK: upstream control (Mac -> device)
