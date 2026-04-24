@@ -1,0 +1,34 @@
+name: VibeBuddy
+options:
+  bundleIdPrefix: com.yourname
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Automatic
+targets:
+  VibeBuddy:
+    type: application
+    platform: macOS
+    sources:
+      - path: VibeBuddy
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yourname.vibebuddy
+        PRODUCT_NAME: VibeBuddy
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "Vibe Buddy needs Bluetooth to connect to your M5Stack hardware."
+        INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.utilities"
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        INFOPLIST_KEY_NSPrincipalClass: NSApplication
+        INFOPLIST_KEY_LSMinimumSystemVersion: "14.0"
+        DEVELOPMENT_TEAM: ""
+        # Disable sandbox during dev so Bluetooth works without extra entitlements.
+        # When we ship we'll opt back in with com.apple.security.device.bluetooth.
+        ENABLE_APP_SANDBOX: NO
+        CODE_SIGN_ENTITLEMENTS: ""
