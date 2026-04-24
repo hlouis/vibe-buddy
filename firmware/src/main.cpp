@@ -9,6 +9,31 @@ static uint32_t lastHeartbeat = 0;
 static uint32_t heartbeatCount = 0;
 static bool linkReported = false;
 
+// Button discrimination:
+// BtnA — click (< CLICK_MS_A) = newline,  hold = start/stop recording
+// BtnB — click (< CLICK_MS_B) = backspace, long-hold = clear-all
+//
+// BtnA uses *speculative* recording: on press we start mic + BLE session
+// immediately so the user sees REC feedback with zero lag. If the release
+// arrives before the click threshold, we emit audio/cancel and a newline
+// edit action instead. The ~200 ms of captured audio is harmless (Mac
+// tears down the in-flight STT session cleanly).
+//
+// Click threshold 350 ms: research shows < 250 ms produces many false
+// long-press detections; 500 ms is the generic UI default. We sit in the
+// middle — because our "long" intent (record) is the *common* one, we
+// bias slightly shorter than the generic 500 ms.
+//
+// BtnB fires clear-all on threshold crossing (700 ms held) for immediate
+// visual feedback on a destructive action; backspace fires on release.
+static constexpr uint32_t CLICK_MS_A = 350;
+static constexpr uint32_t CLICK_MS_B = 700;
+
+static uint32_t aPressAt = 0;
+
+static uint32_t bPressAt = 0;
+static bool bLongFired = false;  // true once we've fired the clear-all
+
 static bool     prevConnected = false;
 static uint16_t prevMtu = 0;
 static bool     prevBtnA = false;
@@ -62,6 +87,15 @@ static void drawScreen() {
     M5.Lcd.setTextColor(WHITE, BLACK);
     M5.Lcd.print("hold A to record    ");
   }
+
+  // Button legend, bottom-aligned. Keeps the operator oriented without
+  // crowding the status area above; muted color so it reads as chrome.
+  M5.Lcd.drawFastHLine(8, 200, 120, DARKGREY);
+  M5.Lcd.setTextColor(DARKGREY, BLACK);
+  M5.Lcd.setCursor(8, 210);
+  M5.Lcd.print("A tap=Enter hold=Rec");
+  M5.Lcd.setCursor(8, 222);
+  M5.Lcd.print("B tap=BkSp  hold=Clr");
   M5.Lcd.setTextColor(WHITE, BLACK);
 }
 
@@ -86,6 +120,15 @@ static void sendHeartbeat() {
                    (unsigned)heartbeatCount,
                    btnAHeld ? "true" : "false");
   bleWrite((const uint8_t*)buf, (size_t)n);
+}
+
+static void sendEditAction(const char* action) {
+  if (!bleConnected()) return;
+  char buf[64];
+  int n = snprintf(buf, sizeof(buf),
+                   "{\"type\":\"edit\",\"action\":\"%s\"}\n", action);
+  bleWrite((const uint8_t*)buf, (size_t)n);
+  Serial.printf("[edit] %s\n", action);
 }
 
 static void maybeReportLink() {
@@ -126,15 +169,45 @@ void setup() {
 void loop() {
   M5.update();
 
+  // ---- BtnA: speculative start on press, decide on release --------------
+  // Why speculative: starting mic immediately gives zero-latency REC
+  // feedback on the screen. If the release arrives before CLICK_MS_A we
+  // simply tell Mac to cancel — no audio was ever sent to Doubao because
+  // Mac holds off on the WebSocket until ~400 ms of audio accumulates.
   if (M5.BtnA.wasPressed()) {
+    aPressAt = millis();
     btnAHeld = true;
-    Serial.println("[btn] A pressed");
+    Serial.println("[btn] A pressed -> start record (speculative)");
     recorderStart();
   }
   if (M5.BtnA.wasReleased()) {
     btnAHeld = false;
-    Serial.println("[btn] A released");
-    recorderStop();
+    uint32_t held = millis() - aPressAt;
+    if (held < CLICK_MS_A) {
+      Serial.printf("[btn] A click %ums -> cancel + newline\n", (unsigned)held);
+      recorderCancel();
+      sendEditAction("newline");
+    } else {
+      Serial.printf("[btn] A released after %ums -> stop record\n", (unsigned)held);
+      recorderStop();
+    }
+  }
+
+  // ---- BtnB: click = backspace, long-hold = clear-all --------------------
+  if (M5.BtnB.wasPressed()) {
+    bPressAt = millis();
+    bLongFired = false;
+  }
+  if (!bLongFired && M5.BtnB.isPressed() &&
+      millis() - bPressAt >= CLICK_MS_B) {
+    bLongFired = true;
+    sendEditAction("clear");
+  }
+  if (M5.BtnB.wasReleased()) {
+    if (!bLongFired) {
+      sendEditAction("backspace");
+    }
+    bLongFired = false;
   }
 
   drainRx();

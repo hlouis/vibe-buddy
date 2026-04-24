@@ -157,6 +157,22 @@ void recorderStop() {
   Serial.println("[rec] stop requested, draining");
 }
 
+// Abort a speculatively-started session without flushing anything. Used
+// when the BtnA hold turned out to be a short click — we kick it off on
+// press for instant REC feedback, then if the release came too soon we
+// call this to undo cleanly. Mac side sees audio/cancel and wipes the
+// half-formed ASR session.
+void recorderCancel() {
+  if (!active && !stopPending) return;
+  active = false;
+  stopPending = false;
+  ringHead = ringTail = 0;
+  const char* s = "{\"type\":\"audio\",\"event\":\"cancel\"}\n";
+  bleWrite((const uint8_t*)s, strlen(s));
+  Serial.printf("[rec] cancelled after frames=%u bytes=%u\n",
+                (unsigned)frameSeq, (unsigned)bytesSent);
+}
+
 bool recorderActive()          { return active; }
 uint32_t recorderBytesSent()   { return bytesSent; }
 uint16_t recorderFrameSeq()    { return frameSeq; }

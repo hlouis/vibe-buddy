@@ -16,6 +16,7 @@
 void recorderInit();         // call once after bleInit()
 void recorderStart();        // BtnA press -> begin session, send audio/start
 void recorderStop();         // BtnA release -> end session, drain + audio/stop
+void recorderCancel();       // short click after speculative start -> abort + audio/cancel
 bool recorderActive();       // true while a session is open
 void recorderTick();         // main-loop pump: ring -> BLE frames
 
