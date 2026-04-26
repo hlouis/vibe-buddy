@@ -11,12 +11,17 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "14.0"
     ENABLE_HARDENED_RUNTIME: YES
     CODE_SIGN_STYLE: Automatic
+packages:
+  VibeBuddyCore:
+    path: ../shared
 targets:
   VibeBuddy:
     type: application
     platform: macOS
     sources:
       - path: VibeBuddy
+    dependencies:
+      - package: VibeBuddyCore
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.yourname.vibebuddy
