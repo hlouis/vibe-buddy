@@ -131,15 +131,22 @@ open VibeBuddy.xcodeproj
 # 在 Xcode 里选择 iPhone / iPad 真机，Cmd+R
 ```
 
-iOS 版与 macOS 版共享 `shared/` 下的 BLE / Audio / ASR 业务逻辑。差异：
+iOS 版与 macOS 版共享 `shared/` 下的 BLE / Audio / ASR 业务逻辑。三个 tab：
 
-- **不能注入文字到其他 App**（iOS 系统不允许 inter-app 键盘注入）。改为在 App 内显示实时转写，并自动写入 **剪贴板**——切到目标 App 长按粘贴即可。
-- **凭证不读 XDG 文件**（iOS 沙盒不存在 XDG 路径），改用 App 内"设置"sheet 输入，存到 UserDefaults（后续会迁到 Keychain）。
-- BLE 后台保活通过 Info.plist 的 `bluetooth-central` background mode；切到后台粘贴时 GATT 链接保持。
+- **转写 tab**:剪贴板模式。实时转写显示在 App 内,自动复制到剪贴板,切到任何其他 App 长按粘贴
+- **浏览器 tab**:WebView 模式。内嵌 WKWebView + 预设书签(Claude / ChatGPT / 豆包 / Kimi / DeepSeek / 通义)。ASR 文字直接 `evaluateJavaScript` 注入到当前焦点的 `<input>` / `<textarea>` / `[contenteditable]`。同时仍写剪贴板兜底
+- **设置 tab**:豆包凭证 + 书签管理
 
-首次启动：
+iOS 限制说明:
+- 系统不允许 inter-app 键盘注入,所以 macOS 版的"自动打字到任意 App"在 iOS 端做不到。WebView 模式是这个能力在 iOS 上的最近替代 —— 仅在 App 内嵌的网页有效
+- 凭证存储用 UserDefaults(后续会迁到 Keychain)
+- 后台保活通过 Info.plist 的 `bluetooth-central` background mode;切到其他 App 粘贴时 GATT 不掉
+- Gemini 暂不支持(Google OAuth 拒绝在 WKWebView 中登录)
+
+首次启动:
 1. 系统弹 **蓝牙权限** → 允许
-2. 右上角齿轮图标 → 填入豆包 App ID / Access Token / Resource ID → 保存
+2. 切到"设置"tab → 填入豆包 App ID / Access Token / Resource ID → 保存
+3. 切到"浏览器"tab → 选 Claude(或其他书签)→ 登录一次 → 输入框点一下获得焦点 → 按住设备 A 按钮说话
 
 ### 验证流程
 
