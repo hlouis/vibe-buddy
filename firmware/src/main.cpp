@@ -41,10 +41,49 @@ static bool     prevLinkReady = false;
 static bool     prevLinkFailed = false;
 static bool     prevRecording = false;
 
+// Battery is read on a 10 s cadence — getBatteryLevel() goes over I²C to
+// the PMIC, so we cache the value and only redraw when the level or
+// charging state actually changes (see change-detection block in loop()).
+static constexpr uint32_t BATTERY_POLL_MS = 10000;
+static uint8_t  g_battery = 0;
+static bool     g_charging = false;
+static uint32_t lastBatteryPoll = 0;
+static uint8_t  prevBattery = 255;
+static bool     prevCharging = false;
+
 static void buildDeviceName() {
   uint8_t mac[6] = {0};
   esp_read_mac(mac, ESP_MAC_BT);
   snprintf(deviceName, sizeof(deviceName), "VibeBuddy-%02X%02X", mac[4], mac[5]);
+}
+
+static void drawBattery() {
+  constexpr int W = 24, H = 10;
+  const int x = M5.Lcd.width() - W - 6;
+  const int y = 4;
+
+  uint16_t color;
+  if (g_battery > 50)      color = GREEN;
+  else if (g_battery > 20) color = YELLOW;
+  else                     color = RED;
+
+  M5.Lcd.drawRect(x, y, W, H, WHITE);
+  M5.Lcd.fillRect(x + W, y + 3, 2, H - 6, WHITE);
+
+  int fillW = ((W - 2) * (int)g_battery) / 100;
+  if (fillW < 0) fillW = 0;
+  if (fillW > W - 2) fillW = W - 2;
+  M5.Lcd.fillRect(x + 1, y + 1, W - 2, H - 2, BLACK);
+  if (fillW > 0) {
+    M5.Lcd.fillRect(x + 1, y + 1, fillW, H - 2, color);
+  }
+
+  if (g_charging) {
+    M5.Lcd.setTextColor(WHITE, BLACK);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(x - 8, y + 1);
+    M5.Lcd.print("+");
+  }
 }
 
 static void drawScreen() {
@@ -53,6 +92,8 @@ static void drawScreen() {
   M5.Lcd.setTextSize(2);
   M5.Lcd.setCursor(8, 20);
   M5.Lcd.print("Vibe Buddy");
+
+  drawBattery();
 
   M5.Lcd.setTextSize(1);
   M5.Lcd.setCursor(8, 60);
@@ -218,6 +259,15 @@ void loop() {
   recorderTick();
 
   uint32_t now = millis();
+  if (lastBatteryPoll == 0 || now - lastBatteryPoll >= BATTERY_POLL_MS) {
+    lastBatteryPoll = now;
+    int lvl = M5.Power.getBatteryLevel();
+    if (lvl < 0) lvl = 0;
+    if (lvl > 100) lvl = 100;
+    g_battery = (uint8_t)lvl;
+    g_charging = M5.Power.isCharging();
+  }
+
   // Silence the 1 Hz heartbeat during recording so JSON doesn't fight
   // audio frames for BLE air time. Still tick the counter.
   if (now - lastHeartbeat >= 1000) {
@@ -245,13 +295,16 @@ void loop() {
   bool failed = bleLinkFailed();
   bool rec = recorderActive();
   if (conn != prevConnected || m != prevMtu || btnAHeld != prevBtnA ||
-      ready != prevLinkReady || failed != prevLinkFailed || rec != prevRecording) {
+      ready != prevLinkReady || failed != prevLinkFailed || rec != prevRecording ||
+      g_battery != prevBattery || g_charging != prevCharging) {
     prevConnected = conn;
     prevMtu = m;
     prevBtnA = btnAHeld;
     prevLinkReady = ready;
     prevLinkFailed = failed;
     prevRecording = rec;
+    prevBattery = g_battery;
+    prevCharging = g_charging;
     drawScreen();
   }
 
