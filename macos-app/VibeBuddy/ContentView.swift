@@ -149,6 +149,14 @@ struct ContentView: View {
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.secondary)
             }
+            if !state.focusEditable, state.session?.active == true {
+                HStack(spacing: 6) {
+                    Image(systemName: "keyboard.badge.ellipsis")
+                        .foregroundColor(.orange)
+                    Text("focus not editable — typing paused (\(state.focusDescription))")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
             if !state.partialText.isEmpty {
                 Text(state.partialText)
                     .foregroundColor(.blue)

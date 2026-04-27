@@ -58,5 +58,13 @@ public final class AppState: ObservableObject {
     @Published public var accessibilityTrusted: Bool = false
     @Published public var configMissing: Bool = false
 
+    // macOS-only: snapshotted at the start of each session by the
+    // FocusGate. When focusEditable is false, the macOS TextInjector
+    // suppresses keystroke injection (avoids the funk-sound when typing
+    // into non-editable focused controls). iOS leaves both fields at
+    // their defaults — its PasteboardHandler is unaffected.
+    @Published public var focusEditable: Bool = true
+    @Published public var focusDescription: String = ""
+
     public init() {}
 }

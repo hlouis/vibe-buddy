@@ -23,10 +23,14 @@ final class TextInjector: TextHandler {
     private var injectedText: String = ""
     var onPermissionRequired: (() -> Void)?
 
+    // Surfaced to the host app when the focus-gate result changes between
+    // sessions, so the UI can show "typing paused — focus not editable".
+    var onFocusChange: ((Bool, String) -> Void)?
+
     // CGEvents can post from any thread; keep typing on a dedicated
     // serial queue so bursty partial updates from ASR don't interleave
     // or pile up on the main thread.
-    private let typingQueue = DispatchQueue(label: "com.yourname.vibebuddy.typing", qos: .userInitiated)
+    private let typingQueue = DispatchQueue(label: "com.hlouis.vibebuddy.typing", qos: .userInitiated)
     private let eventSource = CGEventSource(stateID: .hidSystemState)
 
     // MARK: permission
@@ -53,6 +57,10 @@ final class TextInjector: TextHandler {
             onPermissionRequired?()
             return
         }
+        // Focus gate: if the focused control isn't editable, swallow
+        // silently. Avoids macOS funk-sound on every keystroke when the
+        // user is recording with focus on the desktop / a button.
+        guard FocusGate.shared.isEditable else { return }
         let commonLen = injectedText.commonPrefix(with: newText).count
         let currentLen = injectedText.count
         let backspaces = currentLen - commonLen
@@ -80,12 +88,19 @@ final class TextInjector: TextHandler {
 
     func reset() {
         injectedText = ""
+        // AudioStreamer.startSession() calls reset() at the start of every
+        // recording session — perfect hook to snapshot the focused control
+        // once. Cached for the whole session so per-keystroke injection
+        // doesn't pay an AX cross-process roundtrip.
+        let editable = FocusGate.shared.refresh()
+        onFocusChange?(editable, FocusGate.shared.lastFocusDescription)
     }
 
     // MARK: hardware-button edit actions
 
     func sendEnter() {
         guard checkPermission() else { onPermissionRequired?(); return }
+        guard FocusGate.shared.isEditable else { return }
         // Cursor moved to a new line — the previous injection mirror no
         // longer maps onto the current field contents, so start fresh.
         injectedText = ""
@@ -96,6 +111,7 @@ final class TextInjector: TextHandler {
 
     func sendBackspaceChar() {
         guard checkPermission() else { onPermissionRequired?(); return }
+        guard FocusGate.shared.isEditable else { return }
         if !injectedText.isEmpty {
             injectedText = String(injectedText.dropLast())
         }
@@ -108,6 +124,7 @@ final class TextInjector: TextHandler {
     // text we injected — user asked for "clear all" semantics.
     func clearAll() {
         guard checkPermission() else { onPermissionRequired?(); return }
+        guard FocusGate.shared.isEditable else { return }
         injectedText = ""
         typingQueue.async { [weak self] in
             self?.sendSelectAll()
