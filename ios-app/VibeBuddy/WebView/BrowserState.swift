@@ -78,6 +78,15 @@ final class BrowserState {
             forMainFrameOnly: false
         )
         ucc.addUserScript(focusScript)
+        // Suppress iOS's auto-popup soft keyboard by default. The toolbar
+        // toggle in BrowserTabView flips window.__vbKbSuppressed so the
+        // user can summon the keyboard on demand.
+        let kbScript = WKUserScript(
+            source: InjectionScript.keyboardSuppressor,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: false
+        )
+        ucc.addUserScript(kbScript)
         ucc.add(focusBridge, name: "vbFocus")
         cfg.userContentController = ucc
 

@@ -68,6 +68,9 @@ final class WebViewInjector: ObservableObject, TextHandler {
     @Published var lastResult: InjectionResult = .idle
     @Published var focusInfo: String = ""
     @Published var focusInjectable: Bool = false
+    // Mirrors window.__vbKbSuppressed in the page. Default true: focus
+    // events do not pop the soft keyboard until the user toggles it on.
+    @Published var keyboardSuppressed: Bool = true
 
     // Coalescing in-flight callJavaScript calls.
     private var inFlight: Bool = false
@@ -132,6 +135,27 @@ final class WebViewInjector: ObservableObject, TextHandler {
         // BtnB short-press: remove one character before caret.
         if !mirror.isEmpty { mirror = String(mirror.dropLast()) }
         applyOp(deleteCount: 1, insertText: "")
+    }
+
+    // Toolbar toggle: flip the in-page suppression flag and apply the
+    // new mode to whatever is focused right now. Mutating inputmode on
+    // the focused element hot-swaps the keyboard, so the user sees the
+    // change immediately without us needing to blur/focus (which iOS
+    // gates on user activation anyway).
+    func toggleKeyboardSuppressed() {
+        guard let page = page else { return }
+        let next = !keyboardSuppressed
+        keyboardSuppressed = next
+        Task { @MainActor in
+            do {
+                _ = try await page.callJavaScript(
+                    InjectionScript.setKeyboardSuppressed,
+                    arguments: ["suppressed": next]
+                )
+            } catch {
+                NSLog("[wv] toggleKeyboard error: %@", error.localizedDescription)
+            }
+        }
     }
 
     func clearAll() {

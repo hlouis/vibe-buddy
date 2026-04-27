@@ -118,6 +118,91 @@ enum InjectionScript {
     }
     """#
 
+    // Document-end user script that suppresses iOS's auto-popup keyboard
+    // by stamping `inputmode="none"` on text fields as they receive
+    // focus. The toolbar's keyboard toggle flips `window.__vbKbSuppressed`
+    // — when false, this script restores each field's original inputmode
+    // on focus instead. Per WebKit, mutating inputmode on the already-
+    // focused element hot-swaps the on-screen keyboard, which is what
+    // makes the toggle feel instant without any blur/focus dance (which
+    // wouldn't work anyway — programmatic focus() doesn't satisfy the
+    // user-gesture gate for showing the keyboard).
+    static let keyboardSuppressor: String = #"""
+    (function() {
+        if (window.__vbKbInstalled) return;
+        window.__vbKbInstalled = true;
+        window.__vbKbSuppressed = true;
+
+        function isTextInput(el) {
+            if (!el) return false;
+            const tag = el.tagName;
+            return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable;
+        }
+        function suppress(el) {
+            if (!isTextInput(el)) return;
+            if (!el.hasAttribute('data-vb-orig-im')) {
+                el.setAttribute('data-vb-orig-im', el.getAttribute('inputmode') || '');
+            }
+            el.setAttribute('inputmode', 'none');
+        }
+        function restore(el) {
+            if (!isTextInput(el)) return;
+            const orig = el.getAttribute('data-vb-orig-im');
+            if (orig === null) return;
+            if (orig) el.setAttribute('inputmode', orig);
+            else el.removeAttribute('inputmode');
+            el.removeAttribute('data-vb-orig-im');
+        }
+        document.addEventListener('focusin', function(e) {
+            if (window.__vbKbSuppressed) suppress(e.target);
+            else restore(e.target);
+        }, true);
+        if (document.activeElement && window.__vbKbSuppressed) {
+            suppress(document.activeElement);
+        }
+    })();
+    """#
+
+    // Function body for callJavaScript. Receives `suppressed: Bool` and
+    // applies the new state both to the global flag (for future focusin
+    // events handled by keyboardSuppressor) and to whatever is focused
+    // right now. Mutating inputmode on the focused element is what makes
+    // the keyboard appear/disappear without needing a user-gesture-gated
+    // focus() call.
+    static let setKeyboardSuppressed: String = #"""
+    function focused() {
+        let el = document.activeElement;
+        while (el && el.shadowRoot && el.shadowRoot.activeElement) {
+            el = el.shadowRoot.activeElement;
+        }
+        return el;
+    }
+    window.__vbKbSuppressed = !!suppressed;
+    const el = focused();
+    if (!el || el === document.body) {
+        return { ok: true, focus: '' };
+    }
+    const tag = el.tagName;
+    const isInput = (tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable);
+    if (!isInput) {
+        return { ok: true, focus: '' };
+    }
+    if (suppressed) {
+        if (!el.hasAttribute('data-vb-orig-im')) {
+            el.setAttribute('data-vb-orig-im', el.getAttribute('inputmode') || '');
+        }
+        el.setAttribute('inputmode', 'none');
+    } else {
+        const orig = el.getAttribute('data-vb-orig-im');
+        if (orig !== null) {
+            if (orig) el.setAttribute('inputmode', orig);
+            else el.removeAttribute('inputmode');
+            el.removeAttribute('data-vb-orig-im');
+        }
+    }
+    return { ok: true, focus: tag };
+    """#
+
     // Hardware "clear all" button — wipe the entire focused field, not
     // just our mirror. No arguments needed.
     static let clearAll: String = #"""

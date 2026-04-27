@@ -155,13 +155,21 @@ struct BrowserTabView: View {
                     injector.update(to: s)
                 }
             } label: {
-                Image(systemName: "doc.on.clipboard").frame(width: 44, height: 36)
+                Image(systemName: "doc.on.clipboard")
+                    .frame(width: 44, height: 36)
+                    .foregroundStyle(.secondary)
             }
 
+            // Soft keyboard toggle. Default suppressed (focus does not
+            // pop the keyboard); tap to summon it for the focused field.
             Button {
-                showBookmarks = true
+                injector.toggleKeyboardSuppressed()
             } label: {
-                Image(systemName: "square.grid.2x2").frame(width: 44, height: 36)
+                Image(systemName: injector.keyboardSuppressed
+                      ? "keyboard.chevron.compact.down"
+                      : "keyboard.fill")
+                    .frame(width: 44, height: 36)
+                    .foregroundStyle(injector.keyboardSuppressed ? .secondary : Color.accentColor)
             }
         }
         .font(.body.weight(.medium))
