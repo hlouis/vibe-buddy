@@ -6,19 +6,29 @@ import Combine
 // into (a) structured events on AppState and (b) audio frames for the
 // AudioStreamer. Frame parsing mirrors tools/ble_audio_dump.py exactly so
 // a session that works in Python also works here.
+//
+// The host app passes in a TextHandler at construction time so the same
+// CoreBluetooth + audio stack can drive either macOS keystroke injection
+// or iOS pasteboard staging without any platform conditionals here.
 @MainActor
-final class BLEController: NSObject, ObservableObject {
+public final class BLEController: NSObject, ObservableObject {
     // Nordic UART Service. UUIDs are string-compared by CoreBluetooth; the
     // canonical form is lowercase in Apple's tooling.
-    static let nusService = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
-    static let rxChar     = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
-    static let txChar     = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
+    // Read from CoreBluetooth's nonisolated delegate callbacks. CBUUID
+    // is documented as immutable but Apple hasn't annotated it
+    // Sendable, so under Swift 6 strict concurrency we have to opt in
+    // explicitly with `nonisolated(unsafe)` — safe in practice (these
+    // are `let` value-typed UUIDs, never mutated). namePrefix is a
+    // String literal so plain `nonisolated` is enough.
+    nonisolated(unsafe) public static let nusService = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+    nonisolated(unsafe) public static let rxChar     = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+    nonisolated(unsafe) public static let txChar     = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
 
-    static let namePrefix = "VibeBuddy-"
+    nonisolated public static let namePrefix = "VibeBuddy-"
 
     // Re-entrancy surface to the rest of the app
     private weak var state: AppState?
-    let audio = AudioStreamer()
+    public let audio: AudioStreamer
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
@@ -26,12 +36,13 @@ final class BLEController: NSObject, ObservableObject {
     private var txCharacteristic: CBCharacteristic?
     private var jsonBuffer = Data()
 
-    override init() {
+    public init(textHandler: any TextHandler) {
+        self.audio = AudioStreamer(textHandler: textHandler)
         super.init()
         central = CBCentralManager(delegate: self, queue: .main)
     }
 
-    func bind(state: AppState) {
+    public func bind(state: AppState) {
         self.state = state
         audio.onSessionUpdate = { [weak state] update in
             state?.session = update
@@ -61,12 +72,12 @@ final class BLEController: NSObject, ObservableObject {
 
         // Surface boot-time config and permission state to the UI.
         state.configMissing = (Config.load() == nil)
-        state.accessibilityTrusted = audio.injector.checkPermission()
+        state.accessibilityTrusted = audio.textHandler.checkPermission()
     }
 
-    // MARK: upstream control (Mac -> device)
+    // MARK: upstream control (host -> device)
 
-    func write(_ data: Data) {
+    public func write(_ data: Data) {
         guard let p = peripheral, let rx = rxCharacteristic else { return }
         p.writeValue(data, for: rx, type: .withoutResponse)
     }
@@ -89,7 +100,7 @@ final class BLEController: NSObject, ObservableObject {
 }
 
 extension BLEController: CBCentralManagerDelegate {
-    nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
+    nonisolated public func centralManagerDidUpdateState(_ central: CBCentralManager) {
         Task { @MainActor in
             self.state?.bluetoothPoweredOn = (central.state == .poweredOn)
             switch central.state {
@@ -101,7 +112,7 @@ extension BLEController: CBCentralManagerDelegate {
         }
     }
 
-    nonisolated func centralManager(_ central: CBCentralManager,
+    nonisolated public func centralManager(_ central: CBCentralManager,
                         didDiscover peripheral: CBPeripheral,
                         advertisementData: [String : Any],
                         rssi RSSI: NSNumber) {
@@ -116,7 +127,7 @@ extension BLEController: CBCentralManagerDelegate {
         }
     }
 
-    nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+    nonisolated public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         Task { @MainActor in
             let name = peripheral.name ?? "?"
             NSLog("[ble] connected to %@", name)
@@ -130,7 +141,7 @@ extension BLEController: CBCentralManagerDelegate {
         }
     }
 
-    nonisolated func centralManager(_ central: CBCentralManager,
+    nonisolated public func centralManager(_ central: CBCentralManager,
                         didFailToConnect peripheral: CBPeripheral, error: Error?) {
         Task { @MainActor in
             NSLog("[ble] connect failed: %@", error?.localizedDescription ?? "unknown")
@@ -139,7 +150,7 @@ extension BLEController: CBCentralManagerDelegate {
         }
     }
 
-    nonisolated func centralManager(_ central: CBCentralManager,
+    nonisolated public func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         Task { @MainActor in
             NSLog("[ble] disconnected: %@", error?.localizedDescription ?? "clean")
@@ -152,12 +163,12 @@ extension BLEController: CBCentralManagerDelegate {
 }
 
 extension BLEController: CBPeripheralDelegate {
-    nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+    nonisolated public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard let svc = peripheral.services?.first(where: { $0.uuid == Self.nusService }) else { return }
         peripheral.discoverCharacteristics([Self.rxChar, Self.txChar], for: svc)
     }
 
-    nonisolated func peripheral(_ peripheral: CBPeripheral,
+    nonisolated public func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         Task { @MainActor in
             for c in service.characteristics ?? [] {
@@ -171,7 +182,7 @@ extension BLEController: CBPeripheralDelegate {
         }
     }
 
-    nonisolated func peripheral(_ peripheral: CBPeripheral,
+    nonisolated public func peripheral(_ peripheral: CBPeripheral,
                     didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard characteristic.uuid == Self.txChar, let data = characteristic.value else { return }
         Task { @MainActor in
@@ -241,9 +252,9 @@ extension BLEController: CBPeripheralDelegate {
         guard let action = extractString(from: line, key: "action") else { return }
         NSLog("[edit] %@", action)
         switch action {
-        case "newline":   audio.injector.sendEnter()
-        case "backspace": audio.injector.sendBackspaceChar()
-        case "clear":     audio.injector.clearAll()
+        case "newline":   audio.textHandler.sendEnter()
+        case "backspace": audio.textHandler.sendBackspaceChar()
+        case "clear":     audio.textHandler.clearAll()
         default:          NSLog("[edit] unknown action: %@", action)
         }
     }

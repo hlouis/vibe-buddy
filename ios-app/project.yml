@@ -1,0 +1,68 @@
+name: VibeBuddy-iOS
+options:
+  bundleIdPrefix: com.yourname
+  deploymentTarget:
+    # iOS 26 to use SwiftUI's native WebView/WebPage (WWDC 2025).
+    # See shared/Package.swift for rationale.
+    iOS: "26.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    CODE_SIGN_STYLE: Automatic
+    # Required by GENERATE_INFOPLIST_FILE: YES — without these the
+    # auto-generated Info.plist has no CFBundleVersion /
+    # CFBundleShortVersionString and the installer rejects the .app.
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # 1 = iPhone, 2 = iPad. The single binary covers both form factors.
+    TARGETED_DEVICE_FAMILY: "1,2"
+    SUPPORTS_MACCATALYST: NO
+packages:
+  VibeBuddyCore:
+    path: ../shared
+targets:
+  # Disambiguated from the macOS target inside the umbrella workspace;
+  # PRODUCT_NAME below keeps the built .app called "VibeBuddy".
+  VibeBuddy-iOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: VibeBuddy
+    dependencies:
+      - package: VibeBuddyCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yourname.vibebuddy.ios
+        PRODUCT_NAME: VibeBuddy
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "Vibe Buddy needs Bluetooth to connect to your M5Stack hardware."
+        # Adaptive UI for portrait + both landscape orientations on iPad;
+        # iPhone defaults to portrait-only.
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        # Required so CoreBluetooth keeps the GATT link alive when the
+        # user backgrounds the app to paste a transcript into another app.
+        INFOPLIST_KEY_UIBackgroundModes: "bluetooth-central"
+        DEVELOPMENT_TEAM: ""
+
+  # Unit tests for the iOS-specific glue (TextRouter, PasteboardHandler,
+  # WebViewInjector diff, InjectionScript, BookmarkStore). The shared
+  # business logic has its own SwiftPM test target under ../shared.
+  VibeBuddy-iOSTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: VibeBuddyTests
+    dependencies:
+      - target: VibeBuddy-iOS
+      - package: VibeBuddyCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yourname.vibebuddy.ios.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/VibeBuddy.app/VibeBuddy"
+        BUNDLE_LOADER: "$(TEST_HOST)"

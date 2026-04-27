@@ -1,22 +1,24 @@
 # Vibe Buddy
 
-按住 M5Stack StickS3 的 A 按钮录音，松开后 macOS App 调用豆包流式 ASR，**边说边把文字注入当前焦点应用**。
+按住 M5Stack StickS3 的 A 按钮录音，App 调用豆包流式 ASR 实时转写。macOS 版直接把文字**增量注入当前焦点应用**；iOS / iPadOS 版受系统沙盒限制无法跨 App 注入，改为在 App 内显示并自动写入剪贴板，用户切回目标 App 一次粘贴。
 
 ```
 [ StickS3 ]  ——按住A录音——>  PCM 流 (BLE 2M PHY)
      |                              |
      +—— 屏幕状态 & 按钮             v
-                              [ macOS App ]
-                                    |
-                                    v
-                      豆包流式 ASR (WebSocket)
-                                    |
-                                    v
-                    CGEvent 增量注入到焦点应用
-                      （TextEdit / 任意输入框）
+                          ┌─────────────────────┐
+                          │  VibeBuddyCore (SPM)│
+                          │  BLE / Audio / ASR  │
+                          └────────┬────────────┘
+                                   │
+                  ┌────────────────┴─────────────────┐
+                  ▼                                  ▼
+          [ macOS App ]                       [ iOS / iPadOS App ]
+          CGEvent 增量注入                     UIPasteboard + App 内显示
+          (TextEdit / 任意输入框)              (粘贴到目标 App)
 ```
 
-Phase 1 在小米 M5Stack StickS3 + iPhone 级 2M PHY + 豆包 `bigmodel` 上验证通过，端到端延迟 <1s。
+Phase 1 在 M5Stack StickS3 + 2M PHY + 豆包 `bigmodel` 上验证通过，端到端延迟 <1s。
 
 ## 项目结构
 
@@ -31,18 +33,28 @@ vibe-buddy/
 │       ├── main.cpp             # 主循环、状态机、屏幕
 │       ├── ble_bridge.{h,cpp}   # NUS 服务端、2M PHY/DLE 协商
 │       └── recorder.{h,cpp}     # M5.Mic 录音、ping-pong 缓冲、BLE 分包
-├── macos-app/                   # macOS 应用（Swift/SwiftUI）
-│   ├── project.yml              # xcodegen 生成 xcodeproj 的唯一真相源
-│   └── VibeBuddy/
-│       ├── VibeBuddyApp.swift   # @main + AppState / BLEController 注入
-│       ├── Models.swift         # AppState（视图模型）
-│       ├── ContentView.swift    # 主窗口 UI
-│       ├── BLEManager.swift     # CoreBluetooth Central、帧分派
+├── shared/                      # 共享业务逻辑（Swift Package）
+│   ├── Package.swift
+│   └── Sources/VibeBuddyCore/
+│       ├── BLEController.swift  # CoreBluetooth Central、帧分派
 │       ├── AudioStreamer.swift  # 200ms 裁剪、累积成 ASR chunk
 │       ├── STTService.swift     # 豆包二进制协议 + WebSocket
 │       ├── Gzip.swift           # Compression 框架 + 手动 gzip 封装
-│       ├── Config.swift         # XDG_CONFIG_HOME 读凭证
+│       ├── AppState.swift       # 视图模型（@MainActor ObservableObject）
+│       ├── Config.swift         # 凭证存储（macOS=XDG，iOS=UserDefaults）
+│       └── TextHandler.swift    # 跨平台文字处理协议
+├── macos-app/                   # macOS 应用（Swift/SwiftUI）
+│   ├── project.yml              # xcodegen 生成 xcodeproj 的唯一真相源
+│   └── VibeBuddy/
+│       ├── VibeBuddyApp.swift   # @main，注入 TextInjector
+│       ├── ContentView.swift    # 主窗口 UI
 │       └── TextInjector.swift   # CGEvent 增量注入 + 最长公共前缀 diff
+├── ios-app/                     # iOS / iPadOS 应用（Swift/SwiftUI）
+│   ├── project.yml              # universal: TARGETED_DEVICE_FAMILY=1,2
+│   └── VibeBuddy/
+│       ├── VibeBuddyApp.swift   # @main，注入 PasteboardHandler
+│       ├── ContentView.swift    # 主界面 + 设置 sheet（iPhone+iPad 自适应）
+│       └── PasteboardHandler.swift # UIPasteboard + 应用内 buffer
 └── tools/
     └── ble_audio_dump.py        # 纯 BLE 端到端验证脚本（bleak 客户端）
 ```
@@ -110,6 +122,32 @@ open VibeBuddy.xcodeproj
 1. 系统会弹 **蓝牙权限**请求 → 允许
 2. App 会提示 **Accessibility 权限** → 去系统设置 → 隐私与安全性 → 辅助功能 → 把 VibeBuddy 加进去并打勾 → 回到 App 重启一次
 
+### iOS / iPadOS App
+
+```bash
+cd ios-app
+xcodegen generate
+open VibeBuddy.xcodeproj
+# 在 Xcode 里选择 iPhone / iPad 真机，Cmd+R
+```
+
+iOS 版与 macOS 版共享 `shared/` 下的 BLE / Audio / ASR 业务逻辑。三个 tab：
+
+- **转写 tab**:剪贴板模式。实时转写显示在 App 内,自动复制到剪贴板,切到任何其他 App 长按粘贴
+- **浏览器 tab**:WebView 模式。内嵌 WKWebView + 预设书签(Claude / ChatGPT / 豆包 / Kimi / DeepSeek / 通义)。ASR 文字直接 `evaluateJavaScript` 注入到当前焦点的 `<input>` / `<textarea>` / `[contenteditable]`。同时仍写剪贴板兜底
+- **设置 tab**:豆包凭证 + 书签管理
+
+iOS 限制说明:
+- 系统不允许 inter-app 键盘注入,所以 macOS 版的"自动打字到任意 App"在 iOS 端做不到。WebView 模式是这个能力在 iOS 上的最近替代 —— 仅在 App 内嵌的网页有效
+- 凭证存储用 UserDefaults(后续会迁到 Keychain)
+- 后台保活通过 Info.plist 的 `bluetooth-central` background mode;切到其他 App 粘贴时 GATT 不掉
+- Gemini 暂不支持(Google OAuth 拒绝在 WKWebView 中登录)
+
+首次启动:
+1. 系统弹 **蓝牙权限** → 允许
+2. 切到"设置"tab → 填入豆包 App ID / Access Token / Resource ID → 保存
+3. 切到"浏览器"tab → 选 Claude(或其他书签)→ 登录一次 → 输入框点一下获得焦点 → 按住设备 A 按钮说话
+
 ### 验证流程
 
 1. 给 StickS3 上电，屏幕显示 `VibeBuddy-XXXX` + 黄色 `advertising`
@@ -118,6 +156,25 @@ open VibeBuddy.xcodeproj
 4. 按住设备 A 按钮说中文 5–10 秒
 5. VibeBuddy 窗口里能看到蓝色 partial 文字实时滚动，TextEdit 同步出字
 6. 松开 A → 1 秒内文字稳定为黑色 final 结果
+
+## 单元测试
+
+```bash
+# 共享业务逻辑（Gzip / Config）
+cd shared
+swift test                                     # macOS 上跑
+xcodebuild test -scheme VibeBuddyCore \        # iOS Simulator 上跑
+  -destination 'platform=iOS Simulator,name=iPhone 15'
+
+# iOS App 端（TextRouter / PasteboardHandler / TextDiff /
+#                 InjectionScript / BookmarkStore）
+cd ios-app
+xcodegen generate
+xcodebuild test -scheme VibeBuddy \
+  -destination 'platform=iOS Simulator,name=iPhone 15'
+```
+
+测试不依赖真硬件,WKWebView 的 JS 注入需要在真机上手动验证。
 
 ## 调试工具
 

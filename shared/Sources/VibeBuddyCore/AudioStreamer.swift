@@ -5,28 +5,33 @@ import Foundation
 //
 //   1. front/back 200 ms trim (drops the button-press click on both ends)
 //   2. streaming ASR via STTService (200 ms chunks, Doubao's sweet spot)
-//   3. debug file dump at /tmp/VibeBuddy/out.pcm (lets us replay with ffplay)
+//   3. debug file dump under FileManager.default.temporaryDirectory
+//      (lets us replay with ffplay)
 //
 // The tail buffer that implements the back-trim is also what prevents the
 // closing click from ever reaching ASR or the file. What we discard at
 // stop() is the last 200 ms the device sent us.
+//
+// The TextHandler is injected by the host app — macOS supplies a CGEvent
+// injector, iOS supplies a UIPasteboard staging buffer. AudioStreamer
+// itself is platform-neutral.
 @MainActor
-final class AudioStreamer {
+public final class AudioStreamer {
 
     // UI + side-effect callbacks. Everything here fires on the main actor.
-    var onSessionUpdate: ((AppState.AudioSession) -> Void)?
-    var onDumpPath: ((String) -> Void)?
-    var onSessionEnded: (() -> Void)?
-    var onASRStatus: ((String) -> Void)?
-    var onPartialText: ((String) -> Void)?
-    var onFinalText: ((String) -> Void)?
-    var onASRError: ((String) -> Void)?
-    var onPermissionRequired: (() -> Void)?
+    public var onSessionUpdate: ((AppState.AudioSession) -> Void)?
+    public var onDumpPath: ((String) -> Void)?
+    public var onSessionEnded: (() -> Void)?
+    public var onASRStatus: ((String) -> Void)?
+    public var onPartialText: ((String) -> Void)?
+    public var onFinalText: ((String) -> Void)?
+    public var onASRError: ((String) -> Void)?
+    public var onPermissionRequired: (() -> Void)?
 
-    // Collaborators. STT owns its own WebSocket; injector owns its typing
-    // queue. The streamer just glues them together.
-    let stt = STTService()
-    let injector = TextInjector()
+    // Collaborators. STT owns its own WebSocket; the text handler owns
+    // its typing/pasteboard queue. The streamer just glues them together.
+    public let stt = STTService()
+    public let textHandler: any TextHandler
 
     // Receive-side bookkeeping (mirrors the Python dumper).
     private var file: FileHandle?
@@ -62,16 +67,17 @@ final class AudioStreamer {
     private var sttArmed: Bool = false
     private var sttWarmupTask: Task<Void, Never>?
 
-    init() {
+    public init(textHandler: any TextHandler) {
+        self.textHandler = textHandler
         stt.onPartial = { [weak self] text in
             guard let self else { return }
             self.onPartialText?(text)
-            self.injector.update(to: text)
+            self.textHandler.update(to: text)
         }
         stt.onFinal = { [weak self] text in
             guard let self else { return }
             self.onFinalText?(text)
-            self.injector.update(to: text)
+            self.textHandler.update(to: text)
         }
         stt.onStatus = { [weak self] status in
             self?.onASRStatus?(AudioStreamer.describe(status))
@@ -79,14 +85,14 @@ final class AudioStreamer {
         stt.onError = { [weak self] msg in
             self?.onASRError?(msg)
         }
-        injector.onPermissionRequired = { [weak self] in
+        textHandler.onPermissionRequired = { [weak self] in
             self?.onPermissionRequired?()
         }
     }
 
     // MARK: BLE control-frame hooks
 
-    func handleControl(_ line: String) {
+    public func handleControl(_ line: String) {
         if line.contains("\"event\":\"start\"") {
             sampleRate = extractInt(from: line, key: "sample_rate") ?? 16000
             startSession()
@@ -99,7 +105,7 @@ final class AudioStreamer {
 
     // MARK: BLE audio-frame hook
 
-    func onAudioFrame(seq: UInt16, pcm: Data) {
+    public func onAudioFrame(seq: UInt16, pcm: Data) {
         guard active, file != nil else { return }
 
         var incoming = Data()
@@ -132,14 +138,14 @@ final class AudioStreamer {
         emit()
     }
 
-    func cancelSession() {
+    public func cancelSession() {
         guard active else { return }
         sttWarmupTask?.cancel()
         sttWarmupTask = nil
         if sttArmed {
             NSLog("[audio] cancelled (STT was armed, tearing down)")
             stt.cancel()
-            injector.rollback()
+            textHandler.rollback()
         } else {
             NSLog("[audio] cancelled during warmup — zero network cost")
         }
@@ -172,7 +178,7 @@ final class AudioStreamer {
         active = true
         sttArmed = false
 
-        injector.reset()
+        textHandler.reset()
         // Arm STT after warmup — clicks that cancel within this window
         // cost zero network. If we cross the threshold while still
         // recording, we flush whatever's buffered into Doubao in one

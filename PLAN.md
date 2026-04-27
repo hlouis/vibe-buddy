@@ -11,12 +11,16 @@
 Mac App 调用豆包流式 ASR，实时将识别文字（含中间结果）注入到当前焦点应用，
 同时支持 Claude 权限申请的硬件审批。
 
-**两个子项目**：
+**子项目**：
 
 | 子项目 | 语言/框架 | 说明 |
 |---|---|---|
 | `firmware/` | C++ / Arduino + PlatformIO | M5Stack StickS3 固件 |
-| `macos-app/` | Swift / SwiftUI | macOS 应用 |
+| `shared/` | Swift Package（VibeBuddyCore） | BLE / Audio / Doubao ASR / 状态机；macOS+iOS 共用 |
+| `macos-app/` | Swift / SwiftUI | macOS 应用，CGEvent 文字注入 |
+| `ios-app/` | Swift / SwiftUI | iOS / iPadOS 通用 App，UIPasteboard 暂存 |
+
+跨平台拆分原则：业务逻辑（CoreBluetooth、音频流帧化、豆包二进制协议、AppState）放在 `shared/`，平台相关的"文字落点"通过 `TextHandler` 协议注入 —— macOS 实现是 `TextInjector`（CGEvent 增量键入），iOS 实现是 `PasteboardHandler`（写 UIPasteboard + App 内显示）。iOS 无法跨 App 注入键盘是 Apple 沙盒硬限制，无法绕过。
 
 ---
 
