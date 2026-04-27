@@ -5,9 +5,9 @@ import Compression
 // produces raw DEFLATE (no zlib or gzip wrapping), so we bolt the 10-byte
 // gzip header plus the 8-byte trailer (CRC32 + original size) on ourselves.
 // Doubao SAUC requires actual gzip, not raw deflate.
-enum Gzip {
+public enum Gzip {
 
-    static func compress(_ data: Data) -> Data? {
+    public static func compress(_ data: Data) -> Data? {
         guard let deflated = rawDeflate(data) else { return nil }
 
         var out = Data()
@@ -21,7 +21,7 @@ enum Gzip {
         return out
     }
 
-    static func decompress(_ data: Data) -> Data? {
+    public static func decompress(_ data: Data) -> Data? {
         // 10-byte header + 8-byte trailer minimum.
         guard data.count >= 18 else { return nil }
         guard data[0] == 0x1F, data[1] == 0x8B, data[2] == 0x08 else { return nil }

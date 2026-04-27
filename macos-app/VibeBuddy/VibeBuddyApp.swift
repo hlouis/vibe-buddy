@@ -1,14 +1,10 @@
 import SwiftUI
+import VibeBuddyCore
 
 @main
 struct VibeBuddyApp: App {
     @StateObject private var state = AppState()
-    @StateObject private var ble = BLEController()
-
-    init() {
-        // Wire BLE -> AppState once. The controller owns the CBCentralManager
-        // and handles frame dispatch; AppState is the view model the UI reads.
-    }
+    @StateObject private var ble = BLEController(textHandler: TextInjector())
 
     var body: some Scene {
         WindowGroup("Vibe Buddy") {

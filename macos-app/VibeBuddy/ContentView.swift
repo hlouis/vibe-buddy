@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import VibeBuddyCore
 
 struct ContentView: View {
     @EnvironmentObject var state: AppState
@@ -42,7 +43,7 @@ struct ContentView: View {
                     icon: "exclamationmark.triangle.fill",
                     color: .orange,
                     title: "Doubao config missing",
-                    detail: "Create \(Config.configURL().path) — see README."
+                    detail: "Create \(Config.sourceDescription) — see README."
                 )
             }
             if !state.accessibilityTrusted {

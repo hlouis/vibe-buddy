@@ -1,21 +1,27 @@
 import Foundation
 import ApplicationServices
 import AppKit
+import VibeBuddyCore
 
-// Accessibility-based keystroke injection with incremental diff updates.
+// macOS implementation of the cross-platform TextHandler protocol.
 //
-// The streaming ASR emits cumulative text that may correct earlier
-// outputs. We keep a mirror of what's been typed and, for every new
-// cumulative string, compute the longest common prefix: backspace the
-// divergent tail, then type the new suffix. Unicode characters are
-// emitted via CGEventKeyboardSetUnicodeString so we bypass keyboard
-// layout / input-method quirks entirely.
-final class TextInjector {
+// Streaming ASR emits cumulative text that may correct earlier outputs.
+// We keep a mirror of what's been typed and, for every new cumulative
+// string, compute the longest common prefix: backspace the divergent
+// tail, then type the new suffix. Unicode characters are emitted via
+// CGEventKeyboardSetUnicodeString so we bypass keyboard layout / input-
+// method quirks entirely.
+//
+// On iOS this entire approach is impossible (CGEvent doesn't exist and
+// inter-app keyboard injection is forbidden); see PasteboardHandler in
+// the iOS target for what runs over there instead.
+@MainActor
+final class TextInjector: TextHandler {
 
-    // MARK: state (written only on main actor)
+    // MARK: state
 
-    @MainActor private var injectedText: String = ""
-    @MainActor var onPermissionRequired: (() -> Void)?
+    private var injectedText: String = ""
+    var onPermissionRequired: (() -> Void)?
 
     // CGEvents can post from any thread; keep typing on a dedicated
     // serial queue so bursty partial updates from ASR don't interleave
@@ -26,7 +32,12 @@ final class TextInjector {
     // MARK: permission
 
     @discardableResult
-    func checkPermission(prompt: Bool = false) -> Bool {
+    func checkPermission() -> Bool {
+        return checkPermission(prompt: false)
+    }
+
+    @discardableResult
+    func checkPermission(prompt: Bool) -> Bool {
         if prompt {
             let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
             let opts = [key: true] as CFDictionary
@@ -35,9 +46,8 @@ final class TextInjector {
         return AXIsProcessTrusted()
     }
 
-    // MARK: public API (main actor)
+    // MARK: public API
 
-    @MainActor
     func update(to newText: String) {
         guard checkPermission() else {
             onPermissionRequired?()
@@ -68,14 +78,12 @@ final class TextInjector {
         }
     }
 
-    @MainActor
     func reset() {
         injectedText = ""
     }
 
     // MARK: hardware-button edit actions
 
-    @MainActor
     func sendEnter() {
         guard checkPermission() else { onPermissionRequired?(); return }
         // Cursor moved to a new line — the previous injection mirror no
@@ -86,7 +94,6 @@ final class TextInjector {
         }
     }
 
-    @MainActor
     func sendBackspaceChar() {
         guard checkPermission() else { onPermissionRequired?(); return }
         if !injectedText.isEmpty {
@@ -99,7 +106,6 @@ final class TextInjector {
 
     // Cmd+A then delete. Wipes the ENTIRE focused field, not just the
     // text we injected — user asked for "clear all" semantics.
-    @MainActor
     func clearAll() {
         guard checkPermission() else { onPermissionRequired?(); return }
         injectedText = ""
@@ -112,7 +118,6 @@ final class TextInjector {
 
     // Rollback when a session is cancelled: backspace out everything we
     // injected so the target app is clean.
-    @MainActor
     func rollback() {
         let n = injectedText.count
         injectedText = ""

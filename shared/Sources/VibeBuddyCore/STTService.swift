@@ -54,9 +54,9 @@ private final class WSDelegate: NSObject, URLSessionWebSocketDelegate, URLSessio
 }
 
 @MainActor
-final class STTService: NSObject {
+public final class STTService: NSObject {
 
-    enum Status: Equatable {
+    public enum Status: Equatable {
         case idle
         case connecting
         case streaming
@@ -64,13 +64,26 @@ final class STTService: NSObject {
         case failed(String)
     }
 
+    // Per-platform tag used as the user-id in the full_client_request
+    // frame. Lets us tell macOS-originated traffic from iOS-originated
+    // traffic in the Doubao dashboard.
+    private static let clientTag: String = {
+        #if os(macOS)
+        return "vibe-buddy-mac"
+        #elseif os(iOS)
+        return "vibe-buddy-ios"
+        #else
+        return "vibe-buddy"
+        #endif
+    }()
+
     // Callbacks fire on the main actor. partialText is the current best
     // cumulative transcript (result_type=full); finalText is the last one
     // delivered when the server sees the end-of-audio marker.
-    var onPartial: ((String) -> Void)?
-    var onFinal: ((String) -> Void)?
-    var onStatus: ((Status) -> Void)?
-    var onError: ((String) -> Void)?
+    public var onPartial: ((String) -> Void)?
+    public var onFinal: ((String) -> Void)?
+    public var onStatus: ((Status) -> Void)?
+    public var onError: ((String) -> Void)?
 
     private var task: URLSessionWebSocketTask?
     private var session: URLSession?
@@ -84,13 +97,16 @@ final class STTService: NSObject {
     // only provisioned for the base service need this.
     private let useAsyncEndpoint: Bool = false
 
+    public override init() {
+        super.init()
+    }
+
     // MARK: lifecycle
 
-    func startSession(sampleRate: Int) {
+    public func startSession(sampleRate: Int) {
         guard !active else { return }
         guard let cfg = Config.load() else {
-            let path = Config.configURL().path
-            onStatus?(.failed("missing config at \(path)"))
+            onStatus?(.failed("missing config at \(Config.sourceDescription)"))
             onError?("no config")
             return
         }
@@ -151,7 +167,7 @@ final class STTService: NSObject {
         onStatus?(.streaming)
     }
 
-    func pushAudio(_ pcm: Data) {
+    public func pushAudio(_ pcm: Data) {
         guard active, let task else { return }
         guard let gz = Gzip.compress(pcm) else {
             NSLog("[stt] gzip compress failed")
@@ -167,7 +183,7 @@ final class STTService: NSObject {
         }
     }
 
-    func endSession() {
+    public func endSession() {
         guard active, let task else { return }
         onStatus?(.closing)
         // Per the Go reference: last audio frame uses NEG_WITH_SEQUENCE
@@ -186,7 +202,7 @@ final class STTService: NSObject {
         }
     }
 
-    func cancel() {
+    public func cancel() {
         teardown()
         onStatus?(.idle)
     }
@@ -204,7 +220,7 @@ final class STTService: NSObject {
     private func sendFullClientRequest() {
         let json: [String: Any] = [
             "user": [
-                "uid": "vibe-buddy-mac"
+                "uid": Self.clientTag
             ],
             "audio": [
                 "format": "pcm",
