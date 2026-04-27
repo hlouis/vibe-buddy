@@ -6,7 +6,10 @@ struct VibeBuddyApp: App {
     @StateObject private var state: AppState
     @StateObject private var pasteboard: PasteboardHandler
     @StateObject private var injector: WebViewInjector
-    @StateObject private var browser: BrowserState
+    // BrowserState is @Observable (wraps the iOS 26 WebPage), so it
+    // takes @State for ownership and propagates via the new
+    // .environment(_:) modifier — not @StateObject / .environmentObject.
+    @State private var browser: BrowserState
     @StateObject private var bookmarks: BookmarkStore
     @StateObject private var router: TextRouter
     @StateObject private var ble: BLEController
@@ -28,7 +31,7 @@ struct VibeBuddyApp: App {
         _state = StateObject(wrappedValue: st)
         _pasteboard = StateObject(wrappedValue: pb)
         _injector = StateObject(wrappedValue: inj)
-        _browser = StateObject(wrappedValue: br)
+        _browser = State(wrappedValue: br)
         _bookmarks = StateObject(wrappedValue: bm)
         _router = StateObject(wrappedValue: rt)
         _ble = StateObject(wrappedValue: BLEController(textHandler: rt))
@@ -40,7 +43,7 @@ struct VibeBuddyApp: App {
                 .environmentObject(state)
                 .environmentObject(pasteboard)
                 .environmentObject(injector)
-                .environmentObject(browser)
+                .environment(browser)
                 .environmentObject(bookmarks)
                 .environmentObject(router)
                 .environmentObject(ble)

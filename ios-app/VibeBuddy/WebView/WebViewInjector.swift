@@ -5,7 +5,7 @@ import VibeBuddyCore
 // Pure value type representing one diff step the JS payload should
 // apply to the focused element: delete N characters before the caret,
 // then insert this string. Extracted as a top-level type so the diff
-// algorithm can be unit-tested without standing up a WKWebView.
+// algorithm can be unit-tested without standing up a WebPage.
 struct TextDiff: Equatable {
     let deleteCount: Int
     let insertText: String
@@ -39,23 +39,27 @@ enum InjectionResult: Equatable {
     case exception(String)
 }
 
-// Drives the WKWebView half of the iOS TextHandler split. Holds a weak
-// reference to the BrowserState's WKWebView (set when the browser tab
+// Drives the WebPage half of the iOS TextHandler split. Holds a weak
+// reference to the BrowserState's WebPage (set when the browser tab
 // appears, cleared when it disappears) and applies streaming ASR text
-// as longest-common-prefix diffs through evaluateJavaScript.
+// as longest-common-prefix diffs through callJavaScript.
 //
-// Concurrency note: evaluateJavaScript is async. ASR partials can fire
-// faster than WKWebView returns. We keep one in-flight call at a time
-// and coalesce intermediate updates onto a single `pending` slot so a
-// burst of partials collapses to "go from current mirror straight to
-// the latest text" rather than typing every intermediate state.
+// Concurrency note: callJavaScript is async. ASR partials can fire
+// faster than WebKit returns. We keep one in-flight call at a time and
+// coalesce intermediate updates onto a single `pending` slot so a burst
+// of partials collapses to "go from current mirror straight to the
+// latest text" rather than typing every intermediate state.
+//
+// The class stays ObservableObject (not @Observable) on purpose:
+// BrowserTabView already reads it via @EnvironmentObject and keeping
+// the protocol means TextRouter / TextHandler don't need to learn a
+// new shape for this migration.
 @MainActor
 final class WebViewInjector: ObservableObject, TextHandler {
 
-    // The WKWebView is owned by BrowserState; we keep a weak reference
-    // so the injector doesn't extend the webview's lifetime past tab
-    // dismissal.
-    private weak var webView: WKWebView?
+    // The WebPage is owned by BrowserState; we keep a weak reference so
+    // the injector doesn't extend its lifetime past tab dismissal.
+    private weak var page: WebPage?
 
     // Mirror of what we believe the focused element currently contains
     // (just the portion we've typed). Cleared on every new ASR session.
@@ -65,7 +69,7 @@ final class WebViewInjector: ObservableObject, TextHandler {
     @Published var focusInfo: String = ""
     @Published var focusInjectable: Bool = false
 
-    // Coalescing in-flight evaluateJavaScript calls.
+    // Coalescing in-flight callJavaScript calls.
     private var inFlight: Bool = false
     private var pending: String?
 
@@ -76,12 +80,12 @@ final class WebViewInjector: ObservableObject, TextHandler {
 
     // MARK: lifecycle
 
-    func attach(_ webView: WKWebView) {
-        self.webView = webView
+    func attach(_ page: WebPage) {
+        self.page = page
     }
 
     func detach() {
-        self.webView = nil
+        self.page = nil
     }
 
     // Called when BrowserState's focus tracker posts a focusin /
@@ -94,7 +98,7 @@ final class WebViewInjector: ObservableObject, TextHandler {
     // MARK: TextHandler
 
     func update(to newText: String) {
-        guard webView != nil else { return }
+        guard page != nil else { return }
         if inFlight {
             // Hold only the latest target — any intermediate partial
             // is obsolete the moment a newer one shows up.
@@ -133,10 +137,14 @@ final class WebViewInjector: ObservableObject, TextHandler {
     func clearAll() {
         // Long-press: wipe the focused field entirely.
         mirror = ""
-        guard let webView = webView else { return }
-        webView.evaluateJavaScript(InjectionScript.clearAll) { [weak self] result, error in
-            Task { @MainActor in
-                self?.handleResult(result, error: error)
+        guard let page = page else { return }
+        Task { @MainActor [weak self] in
+            do {
+                let result = try await page.callJavaScript(InjectionScript.clearAll)
+                self?.handle(result: result)
+            } catch {
+                self?.lastResult = .exception(error.localizedDescription)
+                NSLog("[wv] clearAll error: %@", error.localizedDescription)
             }
         }
     }
@@ -165,38 +173,40 @@ final class WebViewInjector: ObservableObject, TextHandler {
     }
 
     private func applyOp(deleteCount: Int, insertText: String) {
-        guard let webView = webView else { return }
+        guard let page = page else { return }
         inFlight = true
-        let script = InjectionScript.applyDiff(
-            deleteCount: deleteCount, insertText: insertText
-        )
-        webView.evaluateJavaScript(script) { [weak self] result, error in
-            Task { @MainActor in
-                guard let self else { return }
-                self.handleResult(result, error: error)
-                self.inFlight = false
-                // If newer text arrived while we were busy, jump
-                // straight to the latest target rather than re-running
-                // every intermediate state we missed.
-                if let p = self.pending {
-                    self.pending = nil
-                    self.runDiff(toward: p)
-                }
+        // Arguments cross the bridge as real JS values — no manual
+        // string escaping, no JSON decoding on the way back. WebKit
+        // marshals the returned JS object as [String: Any].
+        let args: [String: Any] = [
+            "deleteCount": deleteCount,
+            "insertText": insertText,
+        ]
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await page.callJavaScript(
+                    InjectionScript.applyDiff,
+                    arguments: args
+                )
+                self.handle(result: result)
+            } catch {
+                self.lastResult = .exception(error.localizedDescription)
+                NSLog("[wv] inject error: %@", error.localizedDescription)
+            }
+            self.inFlight = false
+            // If newer text arrived while we were busy, jump straight
+            // to the latest target rather than re-running every
+            // intermediate state we missed.
+            if let p = self.pending {
+                self.pending = nil
+                self.runDiff(toward: p)
             }
         }
     }
 
-    private func handleResult(_ result: Any?, error: Error?) {
-        if let error = error {
-            self.lastResult = .exception(error.localizedDescription)
-            NSLog("[wv] inject error: %@", error.localizedDescription)
-            return
-        }
-        guard
-            let json = result as? String,
-            let data = json.data(using: .utf8),
-            let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
+    private func handle(result: Any?) {
+        guard let dict = result as? [String: Any] else {
             self.lastResult = .exception("bad result")
             return
         }

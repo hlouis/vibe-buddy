@@ -1,12 +1,24 @@
 import Foundation
 
-// JavaScript payloads that run inside the WKWebView to apply diff-based
-// text edits on whatever element currently has focus. We keep all the
-// JS as Swift string constants here so the actual injection logic is
-// reviewable in one place — Swift only computes (deleteCount,
-// insertText) and ships the strings across.
+// JavaScript payloads that run inside the SwiftUI WebView (iOS 26+
+// WebPage / callJavaScript) to apply diff-based text edits on whatever
+// element currently has focus. We keep all the JS as Swift string
+// constants here so the actual injection logic is reviewable in one
+// place.
 //
-// The "vbApply" helper handles three element flavors with a graceful
+// Calling convention: WebPage.callJavaScript(_:arguments:) treats the
+// Swift string as a JavaScript *function body* and the Swift dictionary
+// as named arguments injected directly into the function's local scope.
+// We never interpolate user-supplied text into JS source any more — the
+// system marshals each argument as a real JS value, which kills the
+// entire string-escaping (and string-injection-attack) surface that the
+// old WKWebView+evaluateJavaScript path required.
+//
+// Each function body must `return` a plain JS object; WebKit bridges it
+// back to Swift as `[String: Any]?`, so the native side reads it as a
+// dictionary directly — no JSON parsing.
+//
+// The "vbApply" payload handles three element flavors with a graceful
 // fallback chain:
 //
 //   1. <input> / <textarea>  — uses the native value setter so React /
@@ -17,16 +29,16 @@ import Foundation
 //   3. anything else          — returns ok=false so the Swift layer can
 //      surface "no injectable focus" to the UI.
 //
-// Document-start script that posts focus changes back to native lives
-// here too, so the status bar can show "focus: textarea#prompt" before
-// the user even speaks.
+// Document-end script that posts focus changes back to native is
+// installed via WKUserScript on the configuration's userContentController.
 enum InjectionScript {
 
-    // Installed via WKUserScript on every page load. Posts the current
-    // focus descriptor to the "vbFocus" message handler whenever a
-    // focusin / focusout event bubbles up. Tagged forMainFrameOnly:false
-    // so chat sites that nest editors in iframes still notify us when
-    // focus is in their main content area.
+    // Document-end user script. Posts the current focus descriptor to
+    // the "vbFocus" message handler whenever a focusin / focusout event
+    // bubbles up. Tagged forMainFrameOnly:false so chat sites that nest
+    // editors in iframes still notify us when focus is in their main
+    // content area. Unchanged from the WKWebView era: WKUserScript +
+    // WKScriptMessageHandler still exist on WebPage.Configuration.
     static let focusTracker: String = #"""
     (function() {
         function descriptor(el) {
@@ -53,130 +65,93 @@ enum InjectionScript {
     })();
     """#
 
-    // Apply a diff to the focused element. deleteCount characters are
-    // removed before the caret, then insertText is inserted. Returns a
-    // JSON-string result via evaluateJavaScript's completion handler.
-    static func applyDiff(deleteCount: Int, insertText: String) -> String {
-        let escapedInsert = jsString(insertText)
-        return #"""
-        (function(deleteCount, insertText) {
-            function focused() {
-                let el = document.activeElement;
-                while (el && el.shadowRoot && el.shadowRoot.activeElement) {
-                    el = el.shadowRoot.activeElement;
-                }
-                return el;
-            }
-            const el = focused();
-            if (!el || el === document.body) {
-                return JSON.stringify({ ok: false, reason: 'no-focus' });
-            }
-            const tag = el.tagName;
-            const tagDesc = tag + (el.id ? '#' + el.id : '');
-            try {
-                if (tag === 'INPUT' || tag === 'TEXTAREA') {
-                    const proto = (tag === 'INPUT')
-                        ? HTMLInputElement.prototype
-                        : HTMLTextAreaElement.prototype;
-                    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-                    const cur = el.value || '';
-                    const caret = (typeof el.selectionStart === 'number')
-                        ? el.selectionStart : cur.length;
-                    const cutEnd = Math.max(0, caret - deleteCount);
-                    const newVal = cur.slice(0, cutEnd) + insertText + cur.slice(caret);
-                    setter.call(el, newVal);
-                    const newCaret = cutEnd + insertText.length;
-                    try { el.setSelectionRange(newCaret, newCaret); } catch (e) {}
-                    el.dispatchEvent(new InputEvent('input', {
-                        bubbles: true, inputType: 'insertText', data: insertText
-                    }));
-                    return JSON.stringify({ ok: true, mode: 'value-setter', focus: tagDesc });
-                }
-                if (el.isContentEditable) {
-                    el.focus();
-                    for (let i = 0; i < deleteCount; i++) {
-                        document.execCommand('delete', false);
-                    }
-                    if (insertText && insertText.length > 0) {
-                        document.execCommand('insertText', false, insertText);
-                    }
-                    return JSON.stringify({ ok: true, mode: 'execCommand', focus: tagDesc });
-                }
-                return JSON.stringify({ ok: false, reason: 'unsupported', focus: tagDesc });
-            } catch (e) {
-                return JSON.stringify({ ok: false, reason: 'exception', error: String(e) });
-            }
-        })(\#(deleteCount), \#(escapedInsert));
-        """#
+    // Function body for callJavaScript. Receives `deleteCount` (Int) and
+    // `insertText` (String) as named arguments — already type-safe JS
+    // values, no escaping needed. Returns a plain JS object that WebKit
+    // bridges back to the Swift caller as [String: Any].
+    static let applyDiff: String = #"""
+    function focused() {
+        let el = document.activeElement;
+        while (el && el.shadowRoot && el.shadowRoot.activeElement) {
+            el = el.shadowRoot.activeElement;
+        }
+        return el;
     }
-
-    // Hardware "clear all" button — wipe the entire focused field, not
-    // just our mirror. Preserves the existing macOS semantics.
-    static let clearAll: String = #"""
-    (function() {
-        function focused() {
-            let el = document.activeElement;
-            while (el && el.shadowRoot && el.shadowRoot.activeElement) {
-                el = el.shadowRoot.activeElement;
-            }
-            return el;
+    const el = focused();
+    if (!el || el === document.body) {
+        return { ok: false, reason: 'no-focus' };
+    }
+    const tag = el.tagName;
+    const tagDesc = tag + (el.id ? '#' + el.id : '');
+    try {
+        if (tag === 'INPUT' || tag === 'TEXTAREA') {
+            const proto = (tag === 'INPUT')
+                ? HTMLInputElement.prototype
+                : HTMLTextAreaElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+            const cur = el.value || '';
+            const caret = (typeof el.selectionStart === 'number')
+                ? el.selectionStart : cur.length;
+            const cutEnd = Math.max(0, caret - deleteCount);
+            const newVal = cur.slice(0, cutEnd) + insertText + cur.slice(caret);
+            setter.call(el, newVal);
+            const newCaret = cutEnd + insertText.length;
+            try { el.setSelectionRange(newCaret, newCaret); } catch (e) {}
+            el.dispatchEvent(new InputEvent('input', {
+                bubbles: true, inputType: 'insertText', data: insertText
+            }));
+            return { ok: true, mode: 'value-setter', focus: tagDesc };
         }
-        const el = focused();
-        if (!el || el === document.body) {
-            return JSON.stringify({ ok: false, reason: 'no-focus' });
-        }
-        const tag = el.tagName;
-        try {
-            if (tag === 'INPUT' || tag === 'TEXTAREA') {
-                const proto = (tag === 'INPUT')
-                    ? HTMLInputElement.prototype
-                    : HTMLTextAreaElement.prototype;
-                const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-                setter.call(el, '');
-                el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContent' }));
-                return JSON.stringify({ ok: true, mode: 'value-setter' });
-            }
-            if (el.isContentEditable) {
-                el.focus();
-                document.execCommand('selectAll', false);
+        if (el.isContentEditable) {
+            el.focus();
+            for (let i = 0; i < deleteCount; i++) {
                 document.execCommand('delete', false);
-                return JSON.stringify({ ok: true, mode: 'execCommand' });
             }
-            return JSON.stringify({ ok: false, reason: 'unsupported' });
-        } catch (e) {
-            return JSON.stringify({ ok: false, reason: 'exception', error: String(e) });
+            if (insertText && insertText.length > 0) {
+                document.execCommand('insertText', false, insertText);
+            }
+            return { ok: true, mode: 'execCommand', focus: tagDesc };
         }
-    })();
+        return { ok: false, reason: 'unsupported', focus: tagDesc };
+    } catch (e) {
+        return { ok: false, reason: 'exception', error: String(e) };
+    }
     """#
 
-    // MARK: helpers
-
-    // JS string literal escaping. Wraps in double quotes and escapes
-    // backslash, double-quote, newline, carriage return, paragraph and
-    // line separators (the two unicode ones break JS literals). Plain
-    // JSONSerialization is overkill for a single string and produces
-    // identical output for ASCII / BMP text. internal so tests can
-    // verify escaping without parsing the full applyDiff payload.
-    static func jsString(_ s: String) -> String {
-        var out = "\""
-        for ch in s.unicodeScalars {
-            switch ch {
-            case "\\": out.append("\\\\")
-            case "\"": out.append("\\\"")
-            case "\n": out.append("\\n")
-            case "\r": out.append("\\r")
-            case "\t": out.append("\\t")
-            case "\u{2028}": out.append("\\u2028")
-            case "\u{2029}": out.append("\\u2029")
-            default:
-                if ch.value < 0x20 {
-                    out.append(String(format: "\\u%04x", ch.value))
-                } else {
-                    out.append(Character(ch))
-                }
-            }
+    // Hardware "clear all" button — wipe the entire focused field, not
+    // just our mirror. No arguments needed.
+    static let clearAll: String = #"""
+    function focused() {
+        let el = document.activeElement;
+        while (el && el.shadowRoot && el.shadowRoot.activeElement) {
+            el = el.shadowRoot.activeElement;
         }
-        out.append("\"")
-        return out
+        return el;
     }
+    const el = focused();
+    if (!el || el === document.body) {
+        return { ok: false, reason: 'no-focus' };
+    }
+    const tag = el.tagName;
+    try {
+        if (tag === 'INPUT' || tag === 'TEXTAREA') {
+            const proto = (tag === 'INPUT')
+                ? HTMLInputElement.prototype
+                : HTMLTextAreaElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+            setter.call(el, '');
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContent' }));
+            return { ok: true, mode: 'value-setter' };
+        }
+        if (el.isContentEditable) {
+            el.focus();
+            document.execCommand('selectAll', false);
+            document.execCommand('delete', false);
+            return { ok: true, mode: 'execCommand' };
+        }
+        return { ok: false, reason: 'unsupported' };
+    } catch (e) {
+        return { ok: false, reason: 'exception', error: String(e) };
+    }
+    """#
 }

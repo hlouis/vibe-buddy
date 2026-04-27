@@ -1,15 +1,22 @@
-name: VibeBuddy
+name: VibeBuddy-iOS
 options:
   bundleIdPrefix: com.yourname
   deploymentTarget:
-    iOS: "16.0"
+    # iOS 26 to use SwiftUI's native WebView/WebPage (WWDC 2025).
+    # See shared/Package.swift for rationale.
+    iOS: "26.0"
   createIntermediateGroups: true
   groupSortPosition: top
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
     CODE_SIGN_STYLE: Automatic
+    # Required by GENERATE_INFOPLIST_FILE: YES — without these the
+    # auto-generated Info.plist has no CFBundleVersion /
+    # CFBundleShortVersionString and the installer rejects the .app.
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
     # 1 = iPhone, 2 = iPad. The single binary covers both form factors.
     TARGETED_DEVICE_FAMILY: "1,2"
     SUPPORTS_MACCATALYST: NO
@@ -17,7 +24,9 @@ packages:
   VibeBuddyCore:
     path: ../shared
 targets:
-  VibeBuddy:
+  # Disambiguated from the macOS target inside the umbrella workspace;
+  # PRODUCT_NAME below keeps the built .app called "VibeBuddy".
+  VibeBuddy-iOS:
     type: application
     platform: iOS
     sources:
@@ -43,13 +52,13 @@ targets:
   # Unit tests for the iOS-specific glue (TextRouter, PasteboardHandler,
   # WebViewInjector diff, InjectionScript, BookmarkStore). The shared
   # business logic has its own SwiftPM test target under ../shared.
-  VibeBuddyTests:
+  VibeBuddy-iOSTests:
     type: bundle.unit-test
     platform: iOS
     sources:
       - path: VibeBuddyTests
     dependencies:
-      - target: VibeBuddy
+      - target: VibeBuddy-iOS
       - package: VibeBuddyCore
     settings:
       base:

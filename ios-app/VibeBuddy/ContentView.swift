@@ -36,7 +36,10 @@ struct ContentView: View {
                 .tag(Tab.settings)
         }
         .onAppear { applyMode(selected) }
-        .onChange(of: selected) { _, new in applyMode(new) }
+        // Single-arg onChange keeps us compatible with the iOS 16
+        // deployment target; the iOS 17 two-arg overload is unavailable
+        // on iOS 16 and we don't need the old-value here.
+        .onChange(of: selected) { new in applyMode(new) }
     }
 
     private func applyMode(_ tab: Tab) {

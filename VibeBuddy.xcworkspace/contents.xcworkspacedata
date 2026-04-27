@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Workspace
+   version = "1.0">
+   <FileRef
+      location = "group:shared">
+   </FileRef>
+   <FileRef
+      location = "group:macos-app/VibeBuddy-macOS.xcodeproj">
+   </FileRef>
+   <FileRef
+      location = "group:ios-app/VibeBuddy-iOS.xcodeproj">
+   </FileRef>
+</Workspace>

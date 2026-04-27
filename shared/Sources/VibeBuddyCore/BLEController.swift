@@ -14,11 +14,17 @@ import Combine
 public final class BLEController: NSObject, ObservableObject {
     // Nordic UART Service. UUIDs are string-compared by CoreBluetooth; the
     // canonical form is lowercase in Apple's tooling.
-    public static let nusService = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
-    public static let rxChar     = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
-    public static let txChar     = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
+    // Read from CoreBluetooth's nonisolated delegate callbacks. CBUUID
+    // is documented as immutable but Apple hasn't annotated it
+    // Sendable, so under Swift 6 strict concurrency we have to opt in
+    // explicitly with `nonisolated(unsafe)` — safe in practice (these
+    // are `let` value-typed UUIDs, never mutated). namePrefix is a
+    // String literal so plain `nonisolated` is enough.
+    nonisolated(unsafe) public static let nusService = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+    nonisolated(unsafe) public static let rxChar     = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+    nonisolated(unsafe) public static let txChar     = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
 
-    public static let namePrefix = "VibeBuddy-"
+    nonisolated public static let namePrefix = "VibeBuddy-"
 
     // Re-entrancy surface to the rest of the app
     private weak var state: AppState?

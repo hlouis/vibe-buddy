@@ -1,4 +1,4 @@
-name: VibeBuddy
+name: VibeBuddy-macOS
 options:
   bundleIdPrefix: com.yourname
   deploymentTarget:
@@ -11,11 +11,18 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "14.0"
     ENABLE_HARDENED_RUNTIME: YES
     CODE_SIGN_STYLE: Automatic
+    # Required by GENERATE_INFOPLIST_FILE: YES — without these the
+    # auto-generated Info.plist has no CFBundleVersion /
+    # CFBundleShortVersionString and the installer rejects the .app.
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
 packages:
   VibeBuddyCore:
     path: ../shared
 targets:
-  VibeBuddy:
+  # Target name disambiguates from the iOS target inside the umbrella
+  # workspace; PRODUCT_NAME below keeps the built .app called "VibeBuddy".
+  VibeBuddy-macOS:
     type: application
     platform: macOS
     sources:

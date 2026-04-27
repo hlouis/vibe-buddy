@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 import VibeBuddyCore
 
 // The "浏览器" tab — URL bar at top, WKWebView in the middle, toolbar +
@@ -12,7 +13,9 @@ import VibeBuddyCore
 // while the user is actually looking at the browser tab.
 struct BrowserTabView: View {
     @EnvironmentObject var state: AppState
-    @EnvironmentObject var browser: BrowserState
+    // BrowserState is @Observable (wraps the iOS 26 WebPage); the
+    // others are still ObservableObject + @Published.
+    @Environment(BrowserState.self) var browser
     @EnvironmentObject var bookmarks: BookmarkStore
     @EnvironmentObject var router: TextRouter
     // Observed directly so @Published changes on the injector
@@ -28,7 +31,12 @@ struct BrowserTabView: View {
         VStack(spacing: 0) {
             addressBar
             ZStack(alignment: .top) {
-                WebViewRepresentable(webView: browser.webView)
+                // SwiftUI-native WebView (iOS 26+). Replaces the old
+                // UIViewRepresentable bridge — no more touch-event
+                // crashes inside UIGestureRecognizer because we're not
+                // wedging a UIKit view into SwiftUI's hit-test chain
+                // any more, the system owns the integration end-to-end.
+                WebView(browser.page)
                     .ignoresSafeArea(edges: .horizontal)
                 if browser.isLoading {
                     ProgressView(value: browser.loadingProgress)
@@ -47,10 +55,10 @@ struct BrowserTabView: View {
             }
         }
         .onAppear {
-            // Activate the injector against the live webview only while
-            // the browser tab is visible. Other tabs don't get text
-            // injected — they wouldn't see it anyway.
-            injector.attach(browser.webView)
+            // Activate the injector against the live WebPage only
+            // while the browser tab is visible. Other tabs don't get
+            // text injected — they wouldn't see it anyway.
+            injector.attach(browser.page)
             browser.onFocusMessage = { [weak injector] descriptor, isInjectable in
                 injector?.updateFocus(descriptor: descriptor, injectable: isInjectable)
             }
@@ -69,7 +77,11 @@ struct BrowserTabView: View {
     // MARK: address bar
 
     private var addressBar: some View {
-        HStack(spacing: 8) {
+        // @Bindable shim is the @Observable-era replacement for the old
+        // ObservableObject `$envObject.field` syntax — needed because
+        // BrowserState moved off @Published.
+        @Bindable var browser = browser
+        return HStack(spacing: 8) {
             Button {
                 showBookmarks = true
             } label: {
