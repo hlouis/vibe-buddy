@@ -157,6 +157,25 @@ iOS 限制说明:
 5. VibeBuddy 窗口里能看到蓝色 partial 文字实时滚动，TextEdit 同步出字
 6. 松开 A → 1 秒内文字稳定为黑色 final 结果
 
+## 单元测试
+
+```bash
+# 共享业务逻辑（Gzip / Config）
+cd shared
+swift test                                     # macOS 上跑
+xcodebuild test -scheme VibeBuddyCore \        # iOS Simulator 上跑
+  -destination 'platform=iOS Simulator,name=iPhone 15'
+
+# iOS App 端（TextRouter / PasteboardHandler / TextDiff /
+#                 InjectionScript / BookmarkStore）
+cd ios-app
+xcodegen generate
+xcodebuild test -scheme VibeBuddy \
+  -destination 'platform=iOS Simulator,name=iPhone 15'
+```
+
+测试不依赖真硬件,WKWebView 的 JS 注入需要在真机上手动验证。
+
 ## 调试工具
 
 ### 纯 BLE 验证（不走豆包）

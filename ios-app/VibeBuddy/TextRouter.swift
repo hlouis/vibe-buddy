@@ -28,10 +28,15 @@ final class TextRouter: ObservableObject, TextHandler {
     // demands a permission gate on iOS).
     var onPermissionRequired: (() -> Void)?
 
-    let pasteboard: PasteboardHandler
-    let webview: WebViewInjector
+    // Stored as `any TextHandler` (not the concrete types) so tests can
+    // inject mock handlers and assert dispatch behavior. In production
+    // these are PasteboardHandler and WebViewInjector; the concrete
+    // instances are also injected separately as EnvironmentObjects so
+    // SwiftUI views observe their @Published properties directly.
+    let pasteboard: any TextHandler
+    let webview: any TextHandler
 
-    init(pasteboard: PasteboardHandler, webview: WebViewInjector) {
+    init(pasteboard: any TextHandler, webview: any TextHandler) {
         self.pasteboard = pasteboard
         self.webview = webview
     }

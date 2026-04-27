@@ -155,8 +155,9 @@ enum InjectionScript {
     // backslash, double-quote, newline, carriage return, paragraph and
     // line separators (the two unicode ones break JS literals). Plain
     // JSONSerialization is overkill for a single string and produces
-    // identical output for ASCII / BMP text.
-    private static func jsString(_ s: String) -> String {
+    // identical output for ASCII / BMP text. internal so tests can
+    // verify escaping without parsing the full applyDiff payload.
+    static func jsString(_ s: String) -> String {
         var out = "\""
         for ch in s.unicodeScalars {
             switch ch {

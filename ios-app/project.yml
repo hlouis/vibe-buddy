@@ -39,3 +39,21 @@ targets:
         # user backgrounds the app to paste a transcript into another app.
         INFOPLIST_KEY_UIBackgroundModes: "bluetooth-central"
         DEVELOPMENT_TEAM: ""
+
+  # Unit tests for the iOS-specific glue (TextRouter, PasteboardHandler,
+  # WebViewInjector diff, InjectionScript, BookmarkStore). The shared
+  # business logic has its own SwiftPM test target under ../shared.
+  VibeBuddyTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: VibeBuddyTests
+    dependencies:
+      - target: VibeBuddy
+      - package: VibeBuddyCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yourname.vibebuddy.ios.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/VibeBuddy.app/VibeBuddy"
+        BUNDLE_LOADER: "$(TEST_HOST)"

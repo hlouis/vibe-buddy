@@ -18,5 +18,10 @@ let package = Package(
     ],
     targets: [
         .target(name: "VibeBuddyCore", path: "Sources/VibeBuddyCore"),
+        .testTarget(
+            name: "VibeBuddyCoreTests",
+            dependencies: ["VibeBuddyCore"],
+            path: "Tests/VibeBuddyCoreTests"
+        ),
     ]
 )

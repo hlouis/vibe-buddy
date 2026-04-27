@@ -2,6 +2,33 @@ import Foundation
 import WebKit
 import VibeBuddyCore
 
+// Pure value type representing one diff step the JS payload should
+// apply to the focused element: delete N characters before the caret,
+// then insert this string. Extracted as a top-level type so the diff
+// algorithm can be unit-tested without standing up a WKWebView.
+struct TextDiff: Equatable {
+    let deleteCount: Int
+    let insertText: String
+
+    // Longest-common-prefix diff: keep the part of `from` that's still
+    // a prefix of `to`, delete everything after it, then insert
+    // whatever's new. Counts characters as Swift Characters (graphemes),
+    // so combining marks and emoji-with-skin-tone behave intuitively.
+    static func compute(from: String, to: String) -> TextDiff {
+        let common = from.commonPrefix(with: to).count
+        let deleteCount = from.count - common
+        let insertText: String
+        if common < to.count {
+            insertText = String(to[to.index(to.startIndex, offsetBy: common)...])
+        } else {
+            insertText = ""
+        }
+        return TextDiff(deleteCount: deleteCount, insertText: insertText)
+    }
+
+    var isNoOp: Bool { deleteCount == 0 && insertText.isEmpty }
+}
+
 // Result of the most recent JS injection. Surfaced to the status bar so
 // the user can see "已注入到 textarea#prompt" or "无焦点 · 已存剪贴板".
 enum InjectionResult: Equatable {
@@ -128,21 +155,13 @@ final class WebViewInjector: ObservableObject, TextHandler {
     // MARK: private
 
     private func runDiff(toward newText: String) {
-        let common = mirror.commonPrefix(with: newText).count
-        let deleteCount = mirror.count - common
-        let insertText: String
-        if common < newText.count {
-            let start = newText.index(newText.startIndex, offsetBy: common)
-            insertText = String(newText[start...])
-        } else {
-            insertText = ""
-        }
+        let diff = TextDiff.compute(from: mirror, to: newText)
         mirror = newText
-        if deleteCount == 0 && insertText.isEmpty {
+        if diff.isNoOp {
             // No-op, no need to round-trip into the webview.
             return
         }
-        applyOp(deleteCount: deleteCount, insertText: insertText)
+        applyOp(deleteCount: diff.deleteCount, insertText: diff.insertText)
     }
 
     private func applyOp(deleteCount: Int, insertText: String) {

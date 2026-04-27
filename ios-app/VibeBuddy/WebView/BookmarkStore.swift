@@ -17,7 +17,13 @@ final class BookmarkStore: ObservableObject {
 
     @Published var items: [Bookmark]
 
-    private static let defaultsKey = "VibeBuddyBookmarks_v1"
+    static let defaultsKey = "VibeBuddyBookmarks_v1"
+
+    // Backing store + key are injectable so tests can run against a
+    // throw-away UserDefaults suite without polluting the user's real
+    // bookmark list.
+    private let defaults: UserDefaults
+    private let key: String
 
     static let presets: [Bookmark] = [
         Bookmark(name: "Claude",   url: "https://claude.ai/new",         symbol: "sparkle"),
@@ -28,8 +34,10 @@ final class BookmarkStore: ObservableObject {
         Bookmark(name: "通义",     url: "https://tongyi.aliyun.com",     symbol: "cloud"),
     ]
 
-    init() {
-        if let data = UserDefaults.standard.data(forKey: Self.defaultsKey),
+    init(defaults: UserDefaults = .standard, key: String = BookmarkStore.defaultsKey) {
+        self.defaults = defaults
+        self.key = key
+        if let data = defaults.data(forKey: key),
            let decoded = try? JSONDecoder().decode([Bookmark].self, from: data) {
             self.items = decoded
         } else {
@@ -56,7 +64,7 @@ final class BookmarkStore: ObservableObject {
 
     private func save() {
         if let data = try? JSONEncoder().encode(items) {
-            UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+            defaults.set(data, forKey: key)
         }
     }
 }
