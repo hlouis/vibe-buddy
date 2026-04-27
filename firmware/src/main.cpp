@@ -54,6 +54,13 @@ static uint32_t lastBoltToggle = 0;
 static uint8_t  prevBattery = 255;
 static bool     prevCharging = false;
 
+// Front-app mirror, pushed by the host whenever the macOS frontmost app
+// changes ({"type":"front_app","name":"Safari"}). Empty until the first
+// push lands. Cleared on disconnect so a stale name doesn't sit on the
+// screen suggesting a connection that's gone.
+static char g_frontApp[33] = "";
+static char prevFrontApp[33] = "";
+
 static void buildDeviceName() {
   uint8_t mac[6] = {0};
   esp_read_mac(mac, ESP_MAC_BT);
@@ -150,6 +157,36 @@ static void drawScreen() {
     M5.Lcd.print("hold A to record    ");
   }
 
+  // Where the next utterance will land. macOS host pushes the frontmost
+  // app name; iOS host pushes either "Pasteboard" or the focused web page's
+  // title/domain. Wire format is the same — we just render whatever name
+  // arrived. size 2 fits ~10 chars at 8 px left margin on the 135 px LCD;
+  // anything longer truncates to 9 chars + ".." (default GFX font is
+  // ASCII-only, no real ellipsis glyph). No label — keeps semantics the
+  // same across platforms.
+  if (g_frontApp[0] != 0) {
+    char shown[12];
+    size_t n = strnlen(g_frontApp, sizeof(g_frontApp));
+    if (n > 9) {
+      memcpy(shown, g_frontApp, 9);
+      shown[9] = '.'; shown[10] = '.'; shown[11] = 0;
+    } else {
+      memcpy(shown, g_frontApp, n + 1);
+    }
+    M5.Lcd.setTextColor(ORANGE, BLACK);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(8, 140);
+    // Pad to 11 visible chars so a previous-longer name leaves no
+    // ghost pixels behind when a shorter one replaces it.
+    M5.Lcd.printf("> %-9s", shown);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setTextColor(WHITE, BLACK);
+  } else {
+    // Wipe the slot so a previously-displayed name doesn't linger after
+    // a host disconnect.
+    M5.Lcd.fillRect(8, 140, M5.Lcd.width() - 16, 20, BLACK);
+  }
+
   // Button legend, bottom-aligned. Keeps the operator oriented without
   // crowding the status area above; muted color so it reads as chrome.
   M5.Lcd.drawFastHLine(8, 200, 120, DARKGREY);
@@ -161,17 +198,70 @@ static void drawScreen() {
   M5.Lcd.setTextColor(WHITE, BLACK);
 }
 
+// Pull a single 'name' string out of a tiny JSON object. We don't pull
+// in a real JSON parser for the two message shapes the host emits; this
+// covers {"type":"front_app","name":"..."} and is deliberately strict
+// about quoting. Returns true on a successful copy.
+static bool extractJsonName(const char* json, char* out, size_t outCap) {
+  const char* k = strstr(json, "\"name\":\"");
+  if (!k) return false;
+  k += 8;  // past "name":"
+  size_t i = 0;
+  while (*k && *k != '"' && i + 1 < outCap) {
+    if (*k == '\\' && *(k + 1)) {
+      // Reverse a few escapes the host might emit (\\ \" \n).
+      char esc = *(k + 1);
+      char unescaped = 0;
+      switch (esc) {
+        case '"':  unescaped = '"';  break;
+        case '\\': unescaped = '\\'; break;
+        case 'n':  unescaped = ' ';  break;  // newlines on a 1-line label = space
+        case 't':  unescaped = ' ';  break;
+        default:   unescaped = esc;  break;
+      }
+      out[i++] = unescaped;
+      k += 2;
+    } else {
+      out[i++] = *k++;
+    }
+  }
+  out[i] = 0;
+  return i > 0;
+}
+
+// drainRx accumulates bytes off the BLE RX ring into a line buffer; on
+// each \n we look at the line's "type" tag and dispatch. Today only
+// front_app is consumed; unknown types are echoed to serial and dropped.
 static void drainRx() {
-  if (!bleAvailable()) return;
-  char line[256];
-  size_t n = 0;
-  while (bleAvailable() && n < sizeof(line) - 1) {
+  static char  buf[256];
+  static size_t len = 0;
+  while (bleAvailable()) {
     int b = bleRead();
     if (b < 0) break;
-    line[n++] = (char)b;
+    if (b == '\n') {
+      buf[len] = 0;
+      if (len > 0) {
+        if (strstr(buf, "\"type\":\"front_app\"")) {
+          char name[sizeof(g_frontApp)] = "";
+          if (extractJsonName(buf, name, sizeof(name))) {
+            // strncpy is safe here because g_frontApp is sized one larger
+            // than name and we always wrote a terminator above.
+            strncpy(g_frontApp, name, sizeof(g_frontApp) - 1);
+            g_frontApp[sizeof(g_frontApp) - 1] = 0;
+            Serial.printf("[front-app] %s\n", g_frontApp);
+          }
+        } else {
+          Serial.printf("[rx] %u: %s\n", (unsigned)len, buf);
+        }
+      }
+      len = 0;
+    } else if (len < sizeof(buf) - 1) {
+      buf[len++] = (char)b;
+    } else {
+      // Overflow: drop the line, resync at next \n.
+      len = 0;
+    }
   }
-  line[n] = 0;
-  Serial.printf("[rx] %u bytes: %s\n", (unsigned)n, line);
 }
 
 static void sendHeartbeat() {
@@ -335,9 +425,16 @@ void loop() {
   bool ready = bleLinkReady();
   bool failed = bleLinkFailed();
   bool rec = recorderActive();
+  // Wipe the front-app slot on disconnect so a stale name doesn't sit
+  // there suggesting a live link. Reconnect will repopulate via the
+  // host's link-ready resend.
+  if (!conn && g_frontApp[0] != 0) {
+    g_frontApp[0] = 0;
+  }
   if (conn != prevConnected || m != prevMtu || btnAHeld != prevBtnA ||
       ready != prevLinkReady || failed != prevLinkFailed || rec != prevRecording ||
-      g_battery != prevBattery || g_charging != prevCharging) {
+      g_battery != prevBattery || g_charging != prevCharging ||
+      strncmp(g_frontApp, prevFrontApp, sizeof(g_frontApp)) != 0) {
     prevConnected = conn;
     prevMtu = m;
     prevBtnA = btnAHeld;
@@ -346,6 +443,8 @@ void loop() {
     prevRecording = rec;
     prevBattery = g_battery;
     prevCharging = g_charging;
+    strncpy(prevFrontApp, g_frontApp, sizeof(prevFrontApp) - 1);
+    prevFrontApp[sizeof(prevFrontApp) - 1] = 0;
     drawScreen();
   }
 
