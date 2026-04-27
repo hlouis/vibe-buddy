@@ -10,6 +10,12 @@ macos-app/*.xcodeproj/
 ios-app/build/
 ios-app/DerivedData/
 ios-app/*.xcodeproj/
+
+# Per-dev signing settings (Team ID, signing style). Tracked template
+# is Local.xcconfig.example; each contributor copies it to Local.xcconfig
+# and fills in their own DEVELOPMENT_TEAM. See README.
+macos-app/Local.xcconfig
+ios-app/Local.xcconfig
 shared/.build/
 shared/build/
 **/*.xcuserdata/

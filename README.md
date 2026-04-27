@@ -24,6 +24,7 @@ Phase 1 在 M5Stack StickS3 + 2M PHY + 豆包 `bigmodel` 上验证通过，端�
 
 ```
 vibe-buddy/
+├── Makefile                        # 顶层命令入口（make / make gen / make build / ...）
 ├── VibeBuddy.xcworkspace           # 顶层 workspace（macOS + iOS + Core）
 ├── docs/                           # 外部参考资料
 │   └── doubao-asr-offical-doc.md
@@ -45,12 +46,14 @@ vibe-buddy/
 │       └── TextHandler.swift       # 跨平台文字处理协议
 ├── macos-app/                      # macOS 应用
 │   ├── project.yml                 # xcodegen 生成 xcodeproj 的唯一真相源
+│   ├── Local.xcconfig.example      # 模板：DEVELOPMENT_TEAM 等签名设置
 │   └── VibeBuddy/
 │       ├── VibeBuddyApp.swift      # @main，注入 TextInjector
 │       ├── ContentView.swift       # 主窗口 UI
 │       └── TextInjector.swift      # CGEvent 增量注入 + 最长公共前缀 diff
 ├── ios-app/                        # iOS / iPadOS 应用（universal）
 │   ├── project.yml                 # TARGETED_DEVICE_FAMILY=1,2
+│   ├── Local.xcconfig.example      # 模板：DEVELOPMENT_TEAM 等签名设置
 │   ├── VibeBuddy/
 │   │   ├── VibeBuddyApp.swift      # @main，构建三 tab 架构
 │   │   ├── ContentView.swift       # TabView 容器
@@ -81,15 +84,23 @@ vibe-buddy/
 ## 构建前一次性准备
 
 ```bash
-# 1. PlatformIO（固件）
-brew install platformio
+# 1. 工具链
+brew install platformio       # 固件构建 / 烧录
+brew install xcodegen         # macOS / iOS xcodeproj 生成器
+brew install xcbeautify       # xcodebuild 输出美化（make build* / make test* 依赖）
 
-# 2. xcodegen（macOS / iOS 工程生成器）
-brew install xcodegen
-
-# 3. 确保 xcodebuild 指向完整 Xcode（iOS 26 SwiftUI WebView 需要 Xcode 17+）
+# 2. 确保 xcodebuild 指向完整 Xcode（iOS 26 SwiftUI WebView 需要 Xcode 17+）
 sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 sudo xcodebuild -license accept
+
+# 3. 各人签名设置（gitignored，逐人填）
+cp macos-app/Local.xcconfig.example macos-app/Local.xcconfig
+cp ios-app/Local.xcconfig.example   ios-app/Local.xcconfig
+# 编辑两份 Local.xcconfig，把 DEVELOPMENT_TEAM = YOUR_TEAM_ID_HERE
+# 改成你自己的 10 字符 Apple Team ID（Xcode > Settings > Accounts 看）。
+# xcodeproj 是 gitignored 的，每次 `make gen` 都会重写——把 Team 放在
+# Local.xcconfig 里就不会被冲掉，并且 macOS 上 Accessibility 权限授权
+# 也不会在重新生成后失效。
 
 # 4. 豆包 ASR 凭证（放到 XDG 路径，不进仓库；macOS 端读取）
 CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vibe-buddy"
@@ -123,12 +134,27 @@ iOS 端 WebView tab 已迁移到 iOS 26 的 SwiftUI 原生 WebView/WebPage（不
 
 ## 构建与运行
 
+日常命令统一收在根目录的 `Makefile`，敲 `make` 看菜单：
+
+```
+make            # 列出全部 target
+make gen        # 同时重生成 macos / ios xcodeproj
+make build      # 同时编译 macos / ios（Debug）
+make build-macos / make build-ios
+make fw-upload  # 编译并烧录固件
+make fw-monitor # 串口日志
+make test       # SwiftPM + iOS Simulator 全部单测
+make open       # 打开 VibeBuddy.xcworkspace
+make clean
+```
+
+每个 target 旁边标了所需工具（`needs: xcodegen` / `xcbeautify` / `platformio`）；没装就报错，按提示 `brew install` 即可。
+
 ### 固件
 
 ```bash
-cd firmware
-pio run -e m5stack-sticks3 -t upload     # 编译并烧录
-pio device monitor -b 115200             # 串口日志
+make fw-upload      # 编译 + 烧录
+make fw-monitor     # 串口日志（115200，标签：[boot] [ble] [link] [rec] [mic] [tick]）
 ```
 
 连接设备：USB-C 数据线连 Mac。首次烧录如找不到串口，`ls /dev/cu.*` 看设备名。
@@ -136,10 +162,10 @@ pio device monitor -b 115200             # 串口日志
 ### macOS App
 
 ```bash
-cd macos-app
-xcodegen generate
-open VibeBuddy-macOS.xcodeproj
-# 在 Xcode 里 Cmd+R 运行（scheme: VibeBuddy-macOS）
+make gen-macos      # 一次性，project.yml 改了再跑
+make open           # 打开 workspace，在 Xcode 里 Cmd+R（scheme: VibeBuddy-macOS）
+# 或者纯 CLI：
+make build-macos
 ```
 
 首次启动：
@@ -149,10 +175,8 @@ open VibeBuddy-macOS.xcodeproj
 ### iOS / iPadOS App
 
 ```bash
-cd ios-app
-xcodegen generate
-open VibeBuddy-iOS.xcodeproj
-# 在 Xcode 里选择 iPhone / iPad 真机或模拟器，Cmd+R（scheme: VibeBuddy-iOS）
+make gen-ios        # 一次性，project.yml 改了再跑
+make open           # 打开 workspace，在 Xcode 里选真机/模拟器 Cmd+R（scheme: VibeBuddy-iOS）
 ```
 
 iOS 版与 macOS 版共享 `shared/` 下的 BLE / Audio / ASR 业务逻辑。三个 tab：
@@ -186,18 +210,10 @@ iOS 限制说明：
 ## 单元测试
 
 ```bash
-# 共享业务逻辑（Gzip / Config / AudioStreamer / STTService 协议层）
-cd shared
-swift test                                          # macOS 上跑
-xcodebuild test -scheme VibeBuddyCore \             # iOS Simulator 上跑
-  -destination 'platform=iOS Simulator,name=iPhone 15'
-
-# iOS App 端（TextRouter / PasteboardHandler / TextDiff /
-#                 InjectionScript / BookmarkStore 等）
-cd ios-app
-xcodegen generate
-xcodebuild test -scheme VibeBuddy-iOS \
-  -destination 'platform=iOS Simulator,name=iPhone 15'
+make test           # 共享 SwiftPM 测试 + iOS App 测试
+make test-shared    # 只跑 VibeBuddyCore（Gzip / Config / AudioStreamer / STTService）
+make test-ios       # 只跑 iOS App 端（TextRouter / PasteboardHandler / TextDiff /
+                    #                  InjectionScript / BookmarkStore 等）
 ```
 
 测试不依赖真硬件。SwiftUI WebView 的 JS 注入（包含焦点跟踪、increment diff、键盘抑制）需要在真机或模拟器上手动验证。
@@ -219,7 +235,7 @@ ffmpeg -y -f s16le -ar 16000 -ac 1 -i out.pcm out.wav && afplay out.wav
 ### 固件日志
 
 ```bash
-pio device monitor -b 115200 -d firmware
+make fw-monitor
 ```
 
 关键标签：`[boot]` / `[ble]` / `[link]` / `[rec]` / `[mic]` / `[tick]` / `[rec-tick]`

@@ -1,6 +1,6 @@
 name: VibeBuddy-iOS
 options:
-  bundleIdPrefix: com.yourname
+  bundleIdPrefix: com.hlouis
   deploymentTarget:
     # iOS 26 to use SwiftUI's native WebView/WebPage (WWDC 2025).
     # See shared/Package.swift for rationale.
@@ -11,7 +11,10 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     IPHONEOS_DEPLOYMENT_TARGET: "26.0"
-    CODE_SIGN_STYLE: Automatic
+    # CODE_SIGN_STYLE / DEVELOPMENT_TEAM live in Local.xcconfig (per-dev,
+    # gitignored) — see configFiles below and Local.xcconfig.example.
+    # iOS won't even install on a device without a real Team, so each
+    # contributor must fill in their own.
     # Required by GENERATE_INFOPLIST_FILE: YES — without these the
     # auto-generated Info.plist has no CFBundleVersion /
     # CFBundleShortVersionString and the installer rejects the .app.
@@ -20,6 +23,9 @@ settings:
     # 1 = iPhone, 2 = iPad. The single binary covers both form factors.
     TARGETED_DEVICE_FAMILY: "1,2"
     SUPPORTS_MACCATALYST: NO
+configFiles:
+  Debug: Local.xcconfig
+  Release: Local.xcconfig
 packages:
   VibeBuddyCore:
     path: ../shared
@@ -35,7 +41,7 @@ targets:
       - package: VibeBuddyCore
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.yourname.vibebuddy.ios
+        PRODUCT_BUNDLE_IDENTIFIER: com.hlouis.vibebuddy.ios
         PRODUCT_NAME: VibeBuddy
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "Vibe Buddy needs Bluetooth to connect to your M5Stack hardware."
@@ -47,7 +53,6 @@ targets:
         # Required so CoreBluetooth keeps the GATT link alive when the
         # user backgrounds the app to paste a transcript into another app.
         INFOPLIST_KEY_UIBackgroundModes: "bluetooth-central"
-        DEVELOPMENT_TEAM: ""
 
   # Unit tests for the iOS-specific glue (TextRouter, PasteboardHandler,
   # WebViewInjector diff, InjectionScript, BookmarkStore). The shared
@@ -62,7 +67,7 @@ targets:
       - package: VibeBuddyCore
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.yourname.vibebuddy.ios.tests
+        PRODUCT_BUNDLE_IDENTIFIER: com.hlouis.vibebuddy.ios.tests
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/VibeBuddy.app/VibeBuddy"
         BUNDLE_LOADER: "$(TEST_HOST)"

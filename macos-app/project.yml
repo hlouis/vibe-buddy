@@ -1,6 +1,6 @@
 name: VibeBuddy-macOS
 options:
-  bundleIdPrefix: com.yourname
+  bundleIdPrefix: com.hlouis
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
@@ -10,12 +10,18 @@ settings:
     SWIFT_VERSION: "5.9"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
     ENABLE_HARDENED_RUNTIME: YES
-    CODE_SIGN_STYLE: Automatic
+    # CODE_SIGN_STYLE / DEVELOPMENT_TEAM live in Local.xcconfig (per-dev,
+    # gitignored) — see configFiles below and Local.xcconfig.example.
+    # Pinning identity per-dev keeps the macOS Accessibility grant from
+    # being invalidated on every regenerate.
     # Required by GENERATE_INFOPLIST_FILE: YES — without these the
     # auto-generated Info.plist has no CFBundleVersion /
     # CFBundleShortVersionString and the installer rejects the .app.
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
+configFiles:
+  Debug: Local.xcconfig
+  Release: Local.xcconfig
 packages:
   VibeBuddyCore:
     path: ../shared
@@ -31,7 +37,7 @@ targets:
       - package: VibeBuddyCore
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.yourname.vibebuddy
+        PRODUCT_BUNDLE_IDENTIFIER: com.hlouis.vibebuddy
         PRODUCT_NAME: VibeBuddy
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "Vibe Buddy needs Bluetooth to connect to your M5Stack hardware."
@@ -39,7 +45,6 @@ targets:
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
         INFOPLIST_KEY_NSPrincipalClass: NSApplication
         INFOPLIST_KEY_LSMinimumSystemVersion: "14.0"
-        DEVELOPMENT_TEAM: ""
         # Disable sandbox during dev so Bluetooth works without extra entitlements.
         # When we ship we'll opt back in with com.apple.security.device.bluetooth.
         ENABLE_APP_SANDBOX: NO

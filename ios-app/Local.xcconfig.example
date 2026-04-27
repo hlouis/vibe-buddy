@@ -1,0 +1,23 @@
+// Per-developer signing settings. Copied to Local.xcconfig (gitignored)
+// by each contributor before running `xcodegen generate`.
+//
+// Why xcconfig instead of putting these in project.yml directly:
+//   The xcodeproj is gitignored and regenerated from project.yml every
+//   time anyone runs xcodegen. Anything written into pbxproj — including
+//   anything you set via Xcode's Signing & Capabilities tab — gets wiped
+//   on the next regenerate. xcconfig is the supported escape hatch:
+//   project.yml references this file, xcodegen embeds the reference (not
+//   the values), and Xcode reads the actual values at build time.
+
+// Apple Developer team ID. Find yours under Xcode > Settings > Accounts,
+// or `security find-identity -v -p codesigning` (the 10-char string in
+// parens after "Apple Development: …").
+DEVELOPMENT_TEAM = YOUR_TEAM_ID_HERE
+
+// Automatic = Xcode manages provisioning profiles for you. Use Manual
+// only if you have a CI signing pipeline.
+CODE_SIGN_STYLE = Automatic
+
+// Override the bundle ID prefix if you can't sign as com.yourname.*.
+// Leave commented to inherit project.yml's value.
+// PRODUCT_BUNDLE_IDENTIFIER = com.example.vibebuddy.ios

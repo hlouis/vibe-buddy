@@ -1,0 +1,14 @@
+// Per-developer signing settings. Copied to Local.xcconfig (gitignored)
+// by each contributor before running `xcodegen generate`.
+//
+// macOS doesn't strictly need a real Team for local dev (ad-hoc signing
+// works), but Accessibility permissions are bound to the signed identity
+// — re-signing under a different identity invalidates the AX trust grant
+// and you'll have to re-approve Vibe Buddy in System Settings every
+// time. Pinning DEVELOPMENT_TEAM here keeps the identity stable across
+// regenerates so the AX grant survives.
+
+DEVELOPMENT_TEAM = YOUR_TEAM_ID_HERE
+CODE_SIGN_STYLE = Automatic
+
+// PRODUCT_BUNDLE_IDENTIFIER = com.example.vibebuddy
