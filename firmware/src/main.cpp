@@ -1,5 +1,6 @@
 #include <M5Unified.h>
 #include <esp_mac.h>
+#include <stdarg.h>
 #include "ble_bridge.h"
 #include "recorder.h"
 
@@ -54,12 +55,79 @@ static uint32_t lastBoltToggle = 0;
 static uint8_t  prevBattery = 255;
 static bool     prevCharging = false;
 
+// Power profiling tick — 1 s cadence. AXP2101 on StickS3 does not expose
+// a battery-current ADC (M5Unified's getBatteryCurrent() is a stub that
+// returns 0 for this PMIC), so we derive a power proxy from the slope of
+// the battery voltage over a sliding window. mV/min is monotonic in
+// average current draw and is all we need to A/B different configs.
+static constexpr uint32_t POWER_LOG_MS = 1000;
+static constexpr size_t   SLOPE_WIN    = 60;     // 60 samples * 1 s = 60 s window
+static int       g_mv = 0;
+static int       g_mvPerMin = 0;
+static uint32_t  lastPowerLog = 0;
+static int       slopeMv[SLOPE_WIN];
+static uint32_t  slopeMs[SLOPE_WIN];
+static size_t    slopeIdx = 0;
+static bool      slopeFull = false;
+
+static int computeMvPerMin() {
+  size_t count = slopeFull ? SLOPE_WIN : slopeIdx;
+  if (count < 5) return 0;
+  size_t newest = (slopeIdx + SLOPE_WIN - 1) % SLOPE_WIN;
+  size_t oldest = slopeFull ? slopeIdx : 0;
+  int32_t dmv = slopeMv[newest] - slopeMv[oldest];
+  uint32_t dms = slopeMs[newest] - slopeMs[oldest];
+  if (dms == 0) return 0;
+  return (int)(((int64_t)dmv * 60000) / (int32_t)dms);
+}
+
 // Front-app mirror, pushed by the host whenever the macOS frontmost app
 // changes ({"type":"front_app","name":"Safari"}). Empty until the first
 // push lands. Cleared on disconnect so a stale name doesn't sit on the
 // screen suggesting a connection that's gone.
 static char g_frontApp[33] = "";
 static char prevFrontApp[33] = "";
+
+// Mirror a printf-style line to the host as {"type":"log","msg":"..."}.
+// Mac/iOS app already NSLogs every JSON line it receives, so this gives
+// us a USB-free log channel for power profiling. Quiet no-op when no
+// link is up.
+static void bleLogf(const char* fmt, ...) {
+  if (!bleConnected()) return;
+  char body[160];
+  va_list ap;
+  va_start(ap, fmt);
+  int blen = vsnprintf(body, sizeof(body), fmt, ap);
+  va_end(ap);
+  if (blen <= 0) return;
+  if (blen >= (int)sizeof(body)) blen = sizeof(body) - 1;
+
+  char out[256];
+  size_t i = 0;
+  i += snprintf(out + i, sizeof(out) - i, "{\"type\":\"log\",\"msg\":\"");
+  for (int j = 0; j < blen && i + 4 < sizeof(out); j++) {
+    char c = body[j];
+    if (c == '"' || c == '\\') { out[i++] = '\\'; out[i++] = c; }
+    else if (c == '\n' || c == '\r') { out[i++] = ' '; }
+    else { out[i++] = c; }
+  }
+  i += snprintf(out + i, sizeof(out) - i, "\"}\n");
+  bleWrite((const uint8_t*)out, i);
+}
+
+// Live readout, painted above the button legend. mV is the absolute
+// battery voltage (settles in 30-60 s after USB unplug); mV/min is the
+// 60-second sliding-window slope and is our proxy for instantaneous
+// power draw — bigger negative number = more current = more heat.
+// Magenta to read as instrumentation, not normal UI.
+static void drawPowerHud() {
+  M5.Lcd.fillRect(0, 170, M5.Lcd.width(), 14, BLACK);
+  M5.Lcd.setTextColor(MAGENTA, BLACK);
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setCursor(8, 172);
+  M5.Lcd.printf("%dmV %d mV/min", g_mv, g_mvPerMin);
+  M5.Lcd.setTextColor(WHITE, BLACK);
+}
 
 static void buildDeviceName() {
   uint8_t mac[6] = {0};
@@ -186,6 +254,11 @@ static void drawScreen() {
     // a host disconnect.
     M5.Lcd.fillRect(8, 140, M5.Lcd.width() - 16, 20, BLACK);
   }
+
+  // Power-profiling HUD slot. drawScreen() wipes everything, so we
+  // re-paint here too — otherwise the slot stays black for up to 1 s
+  // after a status change.
+  drawPowerHud();
 
   // Button legend, bottom-aligned. Keeps the operator oriented without
   // crowding the status area above; muted color so it reads as chrome.
@@ -370,6 +443,31 @@ void loop() {
   recorderTick();
 
   uint32_t now = millis();
+
+  // Power profiling tick. Sample mV, push into the slope ring, recompute
+  // slope, repaint the HUD, and (if connected) shove a log line at the
+  // host. The slope is our proxy for current draw on this PMIC.
+  if (lastPowerLog == 0 || now - lastPowerLog >= POWER_LOG_MS) {
+    lastPowerLog = now;
+    g_mv = (int)M5.Power.getBatteryVoltage();
+    slopeMv[slopeIdx] = g_mv;
+    slopeMs[slopeIdx] = now;
+    slopeIdx = (slopeIdx + 1) % SLOPE_WIN;
+    if (slopeIdx == 0) slopeFull = true;
+    g_mvPerMin = computeMvPerMin();
+    drawPowerHud();
+    Serial.printf("[pwr] mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d\n",
+                  g_mv, g_mvPerMin,
+                  bleConnected() ? 1 : 0,
+                  recorderActive() ? 1 : 0,
+                  btnAHeld ? 1 : 0);
+    bleLogf("mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d",
+            g_mv, g_mvPerMin,
+            bleConnected() ? 1 : 0,
+            recorderActive() ? 1 : 0,
+            btnAHeld ? 1 : 0);
+  }
+
   if (lastBatteryPoll == 0 || now - lastBatteryPoll >= BATTERY_POLL_MS) {
     lastBatteryPoll = now;
     int lvl = M5.Power.getBatteryLevel();

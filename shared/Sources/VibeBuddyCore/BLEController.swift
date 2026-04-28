@@ -246,6 +246,15 @@ extension BLEController: CBPeripheralDelegate {
             handleEditLine(line)
             return
         }
+        if line.contains("\"type\":\"log\"") {
+            // Structured log channel from the device — used for power
+            // profiling without a USB cable. Prints under a dedicated tag
+            // so it's easy to grep out of the noise.
+            if let msg = extractString(from: line, key: "msg") {
+                NSLog("[dev] %@", msg)
+            }
+            return
+        }
     }
 
     private func handleEditLine(_ line: String) {
