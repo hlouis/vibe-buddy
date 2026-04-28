@@ -20,6 +20,13 @@ void recorderCancel();       // short click after speculative start -> abort + a
 bool recorderActive();       // true while a session is open
 void recorderTick();         // main-loop pump: ring -> BLE frames
 
+// Hint that the user may press BtnA imminently — bring the ES8311 codec
+// up ahead of time so recorderStart() doesn't pay the ~100 ms PLL/DMA
+// warm-up cost. Pass false when the device is going idle to release the
+// codec; teardown is deferred to the recorder task to avoid racing DMA.
+// No-op while a session is active (we never tear down mid-recording).
+void recorderSetMicWarm(bool warm);
+
 // Stats for UI / logging
 uint32_t recorderBytesSent();
 uint16_t recorderFrameSeq();

@@ -79,6 +79,10 @@ class ServerCallbacks : public BLEServerCallbacks {
     // Ask iOS for a tight connection interval. iOS picks 15-30ms by
     // default; audio needs events frequent enough to drain notify queue.
     // 0x06 * 1.25ms = 7.5ms min, 0x0C * 1.25ms = 15ms max.
+    // (Tried idle/recording switching for power savings — Mac negotiates
+    // param updates asynchronously over multiple seconds, so audio
+    // sessions started while still on relaxed params drop frames. The
+    // BLE-radio savings weren't worth the audio regression.)
     esp_ble_conn_update_params_t cp = {};
     memcpy(cp.bda, peerAddr, sizeof(esp_bd_addr_t));
     cp.min_int = 0x06;

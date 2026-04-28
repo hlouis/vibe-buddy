@@ -29,6 +29,31 @@ static volatile uint16_t frameSeq = 0;
 static volatile uint32_t bytesSent = 0;
 static volatile uint32_t overruns = 0;
 
+// ES8311 codec lifecycle. Power-on is non-trivial (~50-100 ms incl. PLL
+// lock + DMA setup) but holding the codec live across long idle periods
+// dissipates the analog frontend continuously. We bring it up on
+// recorderStart and tear it down inside the recorder task itself once
+// drain completes — never from the main thread, so we don't race the
+// in-flight DMA. micShutdownPending is the cross-thread signal.
+static volatile bool micUp = false;
+static volatile bool micShutdownPending = false;
+
+static bool micBringUp() {
+  if (micUp) return true;
+  auto mcfg = M5.Mic.config();
+  mcfg.magnification = 1;
+  mcfg.noise_filter_level = 64;
+  mcfg.sample_rate = SAMPLE_RATE;
+  M5.Mic.config(mcfg);
+  if (!M5.Mic.begin()) {
+    Serial.println("[rec] M5.Mic.begin() failed");
+    return false;
+  }
+  micUp = true;
+  Serial.println("[rec] mic up");
+  return true;
+}
+
 static inline size_t ringAvail() {
   return (ringHead + RING_SAMPLES - ringTail) % RING_SAMPLES;
 }
@@ -44,6 +69,15 @@ static void recorderTask(void*) {
       if (primed) {
         while (M5.Mic.isRecording()) vTaskDelay(1);
         primed = false;
+      }
+      // Honor a pending codec shutdown. Only safe to call here, after
+      // primed==false, so M5.Mic.end() doesn't race in-flight DMA. Done
+      // on this task (not main) for the same reason.
+      if (micShutdownPending && micUp) {
+        M5.Mic.end();
+        micUp = false;
+        micShutdownPending = false;
+        Serial.println("[rec] mic down");
       }
       vTaskDelay(pdMS_TO_TICKS(5));
       continue;
@@ -108,24 +142,15 @@ void recorderInit() {
   }
   Serial.printf("[rec] ring %u samples allocated in PSRAM\n", (unsigned)RING_SAMPLES);
 
-  // M5.Mic on StickS3 auto-configures ES8311 + I2S. Defaults apply a
-  // heavy digital magnification (16x) which saturates any normal-voice
-  // input. Drop it to 1 and enable the mild noise filter so clipping
-  // goes away and room noise gets suppressed.
-  auto mcfg = M5.Mic.config();
-  mcfg.magnification = 1;
-  mcfg.noise_filter_level = 64;  // cheap 1-pole HP; kills DC + low hiss
-  mcfg.sample_rate = SAMPLE_RATE;
-  M5.Mic.config(mcfg);
-
-  if (!M5.Mic.begin()) {
-    Serial.println("[rec] M5.Mic.begin() failed");
-    return;
-  }
-  Serial.println("[rec] M5.Mic ready");
-
+  // ES8311 / I2S start-up is deferred to recorderStart(). Keeping the
+  // codec powered through long idle periods was a measurable share of
+  // baseline current draw; we accept the ~50 ms warm-up cost on the
+  // first press of each session in exchange.
+  //
   // Core 0 runs Arduino loop + BLE stack; put the mic reader on core 1
   // so audio DMA handling never stalls behind BLE notify bookkeeping.
+  // The task is started here even though the mic isn't up yet — it
+  // sits in the !active branch doing vTaskDelay until needed.
   xTaskCreatePinnedToCore(recorderTask, "recorder", 4096, nullptr, 5, nullptr, 1);
 }
 
@@ -133,6 +158,12 @@ void recorderStart() {
   if (active) return;
   if (!bleLinkReady()) {
     Serial.println("[rec] refused start: BLE link not ready (need 2M PHY)");
+    return;
+  }
+  // Cancel any pending teardown — we're about to need the codec.
+  micShutdownPending = false;
+  if (!micBringUp()) {
+    Serial.println("[rec] start aborted: codec failed to come up");
     return;
   }
   ringHead = ringTail = 0;
@@ -167,10 +198,21 @@ void recorderCancel() {
   active = false;
   stopPending = false;
   ringHead = ringTail = 0;
+  micShutdownPending = true;   // task will end() the codec on its idle pass
   const char* s = "{\"type\":\"audio\",\"event\":\"cancel\"}\n";
   bleWrite((const uint8_t*)s, strlen(s));
   Serial.printf("[rec] cancelled after frames=%u bytes=%u\n",
                 (unsigned)frameSeq, (unsigned)bytesSent);
+}
+
+void recorderSetMicWarm(bool warm) {
+  if (active) return;             // never disturb a live session
+  if (warm) {
+    micShutdownPending = false;
+    micBringUp();                 // idempotent
+  } else if (micUp) {
+    micShutdownPending = true;    // task will end() on next idle pass
+  }
 }
 
 bool recorderActive()          { return active; }
@@ -233,5 +275,8 @@ void recorderTick() {
     bleWrite((const uint8_t*)s, strlen(s));
     Serial.printf("[rec] stopped: frames=%u bytes=%u overruns=%u\n",
                   (unsigned)frameSeq, (unsigned)bytesSent, (unsigned)overruns);
+    // Drain done — release the codec. Recorder task will pick this up
+    // on its next idle pass and call M5.Mic.end() safely.
+    micShutdownPending = true;
   }
 }

@@ -55,6 +55,72 @@ static uint32_t lastBoltToggle = 0;
 static uint8_t  prevBattery = 255;
 static bool     prevCharging = false;
 
+// Backlight power management. The LCD + backlight is the single largest
+// idle drain on StickS3. We hold full brightness while the user is
+// active, drop to a dim "still readable" level after DIM_AFTER_MS, and
+// fully off after OFF_AFTER_MS. While charging we never dim — the user
+// is plausibly looking at the device for the charge state.
+//
+// "Activity" = button press, BLE connect/disconnect, recorder start, or
+// any front_app push from the host (the host only pushes on app switch,
+// so this implies the user is at the desk).
+static constexpr uint8_t  BRIGHT_FULL = 180;
+static constexpr uint8_t  BRIGHT_DIM  = 30;
+static constexpr uint8_t  BRIGHT_OFF  = 0;
+static constexpr uint32_t DIM_AFTER_MS = 15000;
+static constexpr uint32_t OFF_AFTER_MS = 60000;
+static uint8_t  currentBrightness = BRIGHT_FULL;
+static uint32_t lastActivityMs = 0;
+
+static void touchActivity() { lastActivityMs = millis(); }
+
+static void applyBrightness(uint8_t target) {
+  if (target == currentBrightness) return;
+  currentBrightness = target;
+  M5.Lcd.setBrightness(target);
+}
+
+static void updateBrightness() {
+  uint8_t target;
+  if (g_charging) {
+    target = BRIGHT_FULL;
+  } else {
+    uint32_t idle = millis() - lastActivityMs;
+    if      (idle < DIM_AFTER_MS) target = BRIGHT_FULL;
+    else if (idle < OFF_AFTER_MS) target = BRIGHT_DIM;
+    else                          target = BRIGHT_OFF;
+  }
+  applyBrightness(target);
+}
+
+// CPU frequency management. ESP32-S3 idle current scales roughly with
+// the active clock, and at 240 MHz the chip dissipates noticeably more
+// than at 80 MHz even when loop() is mostly delay()ing — the Idle task
+// doesn't enter light sleep without esp_pm_configure(), so the clock
+// keeps running. Two speeds based on user engagement:
+//   - recording OR screen at full brightness → 240 MHz (responsive)
+//   - everything else → 80 MHz (idle, dim, or off)
+// BLE controller runs on its own RF clock and tolerates either; I2S /
+// audio paths are only active when recording, which forces 240 anyway.
+static constexpr uint32_t CPU_HIGH_MHZ = 240;
+static constexpr uint32_t CPU_LOW_MHZ  = 80;
+static uint32_t currentCpuMhz = CPU_HIGH_MHZ;
+
+static void applyCpuFreq(uint32_t mhz) {
+  if (mhz == currentCpuMhz) return;
+  setCpuFrequencyMhz(mhz);
+  currentCpuMhz = mhz;
+  // setCpuFrequencyMhz reconfigures UART dividers internally; no need
+  // to re-init Serial. A handful of in-flight bytes may garble.
+  Serial.printf("[cpu] -> %u MHz\n", (unsigned)mhz);
+}
+
+static void updateCpuFreq() {
+  uint32_t target = (recorderActive() || currentBrightness == BRIGHT_FULL)
+                    ? CPU_HIGH_MHZ : CPU_LOW_MHZ;
+  applyCpuFreq(target);
+}
+
 // Power profiling tick — 1 s cadence. AXP2101 on StickS3 does not expose
 // a battery-current ADC (M5Unified's getBatteryCurrent() is a stub that
 // returns 0 for this PMIC), so we derive a power proxy from the slope of
@@ -91,7 +157,8 @@ static char prevFrontApp[33] = "";
 // Mirror a printf-style line to the host as {"type":"log","msg":"..."}.
 // Mac/iOS app already NSLogs every JSON line it receives, so this gives
 // us a USB-free log channel for power profiling. Quiet no-op when no
-// link is up.
+// link is up (Step 0 baseline measurements that need it use the on-screen
+// HUD or Serial via Grove UART).
 static void bleLogf(const char* fmt, ...) {
   if (!bleConnected()) return;
   char body[160];
@@ -376,7 +443,9 @@ void setup() {
   cfg.internal_spk = false;
   M5.begin(cfg);
   M5.Lcd.setRotation(0);
-  M5.Lcd.setBrightness(180);
+  M5.Lcd.setBrightness(BRIGHT_FULL);
+  currentBrightness = BRIGHT_FULL;
+  touchActivity();
   Serial.begin(115200);
   delay(200);
   Serial.println();
@@ -399,40 +468,67 @@ void loop() {
   // feedback on the screen. If the release arrives before CLICK_MS_A we
   // simply tell Mac to cancel — no audio was ever sent to Doubao because
   // Mac holds off on the WebSocket until ~400 ms of audio accumulates.
+  // When the screen is fully off, the first press of either button only
+  // wakes the display. The "real" action fires on the next press. This
+  // matches phone-style ergonomics and prevents an accidental record /
+  // backspace when the user just wants to peek at status.
+  static bool aWakeOnly = false;
+  static bool bWakeOnly = false;
+
   if (M5.BtnA.wasPressed()) {
-    aPressAt = millis();
-    btnAHeld = true;
-    Serial.println("[btn] A pressed -> start record (speculative)");
-    recorderStart();
+    bool wasOff = (currentBrightness == BRIGHT_OFF);
+    touchActivity();
+    if (wasOff) {
+      aWakeOnly = true;
+    } else {
+      aPressAt = millis();
+      btnAHeld = true;
+      Serial.println("[btn] A pressed -> start record (speculative)");
+      recorderStart();
+    }
   }
   if (M5.BtnA.wasReleased()) {
-    btnAHeld = false;
-    uint32_t held = millis() - aPressAt;
-    if (held < CLICK_MS_A) {
-      Serial.printf("[btn] A click %ums -> cancel + newline\n", (unsigned)held);
-      recorderCancel();
-      sendEditAction("newline");
-    } else {
-      Serial.printf("[btn] A released after %ums -> stop record\n", (unsigned)held);
-      recorderStop();
+    if (aWakeOnly) {
+      aWakeOnly = false;
+    } else if (btnAHeld) {
+      btnAHeld = false;
+      uint32_t held = millis() - aPressAt;
+      if (held < CLICK_MS_A) {
+        Serial.printf("[btn] A click %ums -> cancel + newline\n", (unsigned)held);
+        recorderCancel();
+        sendEditAction("newline");
+      } else {
+        Serial.printf("[btn] A released after %ums -> stop record\n", (unsigned)held);
+        recorderStop();
+      }
     }
   }
 
   // ---- BtnB: click = backspace, long-hold = clear-all --------------------
   if (M5.BtnB.wasPressed()) {
-    bPressAt = millis();
-    bLongFired = false;
+    bool wasOff = (currentBrightness == BRIGHT_OFF);
+    touchActivity();
+    if (wasOff) {
+      bWakeOnly = true;
+    } else {
+      bPressAt = millis();
+      bLongFired = false;
+    }
   }
-  if (!bLongFired && M5.BtnB.isPressed() &&
+  if (!bWakeOnly && !bLongFired && M5.BtnB.isPressed() &&
       millis() - bPressAt >= CLICK_MS_B) {
     bLongFired = true;
     sendEditAction("clear");
   }
   if (M5.BtnB.wasReleased()) {
-    if (!bLongFired) {
-      sendEditAction("backspace");
+    if (bWakeOnly) {
+      bWakeOnly = false;
+    } else {
+      if (!bLongFired) {
+        sendEditAction("backspace");
+      }
+      bLongFired = false;
     }
-    bLongFired = false;
   }
 
   drainRx();
@@ -456,16 +552,20 @@ void loop() {
     if (slopeIdx == 0) slopeFull = true;
     g_mvPerMin = computeMvPerMin();
     drawPowerHud();
-    Serial.printf("[pwr] mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d\n",
+    Serial.printf("[pwr] mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u cpu=%u\n",
                   g_mv, g_mvPerMin,
                   bleConnected() ? 1 : 0,
                   recorderActive() ? 1 : 0,
-                  btnAHeld ? 1 : 0);
-    bleLogf("mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d",
+                  btnAHeld ? 1 : 0,
+                  (unsigned)currentBrightness,
+                  (unsigned)currentCpuMhz);
+    bleLogf("mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u cpu=%u",
             g_mv, g_mvPerMin,
             bleConnected() ? 1 : 0,
             recorderActive() ? 1 : 0,
-            btnAHeld ? 1 : 0);
+            btnAHeld ? 1 : 0,
+            (unsigned)currentBrightness,
+            (unsigned)currentCpuMhz);
   }
 
   if (lastBatteryPoll == 0 || now - lastBatteryPoll >= BATTERY_POLL_MS) {
@@ -533,6 +633,15 @@ void loop() {
       ready != prevLinkReady || failed != prevLinkFailed || rec != prevRecording ||
       g_battery != prevBattery || g_charging != prevCharging ||
       strncmp(g_frontApp, prevFrontApp, sizeof(g_frontApp)) != 0) {
+    // Any externally-driven state change counts as user activity — the
+    // host only pushes front_app on a real app switch, BLE link changes
+    // imply someone's plugging things in or moving around, etc. Don't
+    // touch on btnAHeld toggles though — those are already handled by
+    // the press handlers above and would double-touch.
+    if (conn != prevConnected || ready != prevLinkReady || rec != prevRecording ||
+        strncmp(g_frontApp, prevFrontApp, sizeof(g_frontApp)) != 0) {
+      touchActivity();
+    }
     prevConnected = conn;
     prevMtu = m;
     prevBtnA = btnAHeld;
@@ -545,6 +654,14 @@ void loop() {
     prevFrontApp[sizeof(prevFrontApp) - 1] = 0;
     drawScreen();
   }
+
+  updateBrightness();
+  updateCpuFreq();
+  // Pre-warm the mic codec while the user is plausibly about to press
+  // BtnA — i.e., screen is at full brightness AND the BLE link is
+  // ready. Removes the ~100 ms cold-start gap from the first chunk of
+  // audio. Released as soon as the screen dims or the link drops.
+  recorderSetMicWarm(bleLinkReady() && currentBrightness == BRIGHT_FULL);
 
   // Short idle; recorderTick already drains the ring aggressively within
   // a single call, so we only need to yield briefly.
