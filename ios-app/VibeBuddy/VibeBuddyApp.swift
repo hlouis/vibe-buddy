@@ -13,6 +13,7 @@ struct VibeBuddyApp: App {
     @StateObject private var bookmarks: BookmarkStore
     @StateObject private var router: TextRouter
     @StateObject private var ble: BLEController
+    @Environment(\.scenePhase) private var scenePhase
 
     @MainActor
     init() {
@@ -56,6 +57,13 @@ struct VibeBuddyApp: App {
                 .onChange(of: currentTarget) { _, name in pushFrontApp(name) }
                 .onChange(of: state.linkParams.mtu) { old, new in
                     if old == 0 && new > 0 { pushFrontApp(currentTarget) }
+                }
+                // iOS suspends URLSession in the background, so the ASR
+                // WebSocket's receive loop never fires its close callback
+                // and STTService.active stays stuck true. Force a teardown
+                // on backgrounding so the next button press starts clean.
+                .onChange(of: scenePhase) { _, phase in
+                    if phase != .active { ble.audio.cancelSession() }
                 }
         }
     }

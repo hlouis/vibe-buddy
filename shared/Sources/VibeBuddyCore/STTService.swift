@@ -91,6 +91,13 @@ public final class STTService: NSObject {
     private var active: Bool = false
     private var sampleRate: Int = 16000
     private var seq: Int32 = 1    // per Go demo: starts at 1, negated for last
+    private var closeWatchdog: Task<Void, Never>?
+
+    // Server normally closes within ~1s of the final audio frame. If the
+    // socket goes silent (e.g. iOS suspended URLSession in the background),
+    // teardown never runs and `active` stays true — blocking the next
+    // startSession. Bound the wait so a stale session can't leak.
+    private static let closeWatchdogSeconds: UInt64 = 5
 
     // Flip to true to fall back to the plain bigmodel endpoint if the
     // optimized bigmodel_async handshake fails. Resource IDs that are
@@ -104,7 +111,10 @@ public final class STTService: NSObject {
     // MARK: lifecycle
 
     public func startSession(sampleRate: Int) {
-        guard !active else { return }
+        // Always start clean. A prior session may still be in its close
+        // handshake (active=true, socket draining) when the user presses
+        // again — silently skipping would feed audio into a dying socket.
+        if active { teardown() }
         guard let cfg = Config.load() else {
             onStatus?(.failed("missing config at \(Config.sourceDescription)"))
             onError?("no config")
@@ -176,9 +186,18 @@ public final class STTService: NSObject {
         seq += 1
         let thisSeq = seq
         let frame = audioFrame(payload: gz, seq: thisSeq, isLast: false)
-        task.send(.data(frame)) { err in
+        let bound = task
+        bound.send(.data(frame)) { [weak self] err in
             if let err = err {
                 NSLog("[stt] audio send err (seq=%d): %@", thisSeq, String(describing: err))
+                Task { @MainActor in
+                    // Same stale-callback guard as receiveLoop: ignore errors
+                    // for a task that's already been replaced.
+                    guard let self, self.task === bound, self.active else { return }
+                    self.onStatus?(.failed(err.localizedDescription))
+                    self.onError?(err.localizedDescription)
+                    self.teardown()
+                }
             }
         }
     }
@@ -200,6 +219,21 @@ public final class STTService: NSObject {
                 Task { @MainActor in self?.teardown() }
             }
         }
+        closeWatchdog?.cancel()
+        let watchedTask = task
+        closeWatchdog = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.closeWatchdogSeconds * 1_000_000_000)
+            // Task.sleep with try? swallows the CancellationError, so we
+            // MUST check isCancelled or this block runs after teardown.
+            // Also pin to the original task: even if a new session has
+            // started (active=true again), don't kill it.
+            if Task.isCancelled { return }
+            await MainActor.run {
+                guard let self, self.active, self.task === watchedTask else { return }
+                NSLog("[stt] close watchdog fired — forcing teardown")
+                self.teardown()
+            }
+        }
     }
 
     public func cancel() {
@@ -209,6 +243,8 @@ public final class STTService: NSObject {
 
     private func teardown() {
         active = false
+        closeWatchdog?.cancel()
+        closeWatchdog = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         session?.invalidateAndCancel()
@@ -286,9 +322,13 @@ public final class STTService: NSObject {
 
     private func receiveLoop() {
         guard let task else { return }
-        task.receive { [weak self] result in
+        // Bind the loop to this specific task. After a teardown/restart the
+        // old task's callbacks still fire (with NSURLErrorCancelled) — if we
+        // acted on them they'd tear down the *new* session.
+        let bound = task
+        bound.receive { [weak self] result in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.task === bound else { return }
                 switch result {
                 case .success(.data(let data)):
                     self.handleFrame(data)
