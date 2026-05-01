@@ -16,33 +16,29 @@ import VibeBuddyCore
 // toggle. The tab the user is looking at is the destination they get.
 struct ContentView: View {
 
-    enum Tab: Hashable { case transcript, browser, settings }
+    // Renamed off `Tab` so it doesn't shadow SwiftUI.Tab in the body.
+    enum AppTab: Hashable { case transcript, browser, settings }
 
     @EnvironmentObject var router: TextRouter
-    @State private var selected: Tab = .transcript
+    @State private var selected: AppTab = .transcript
 
     var body: some View {
         TabView(selection: $selected) {
-            TranscriptTabView()
-                .tabItem { Label("转写", systemImage: "waveform") }
-                .tag(Tab.transcript)
-
-            BrowserTabView()
-                .tabItem { Label("浏览器", systemImage: "globe") }
-                .tag(Tab.browser)
-
-            SettingsTabView()
-                .tabItem { Label("设置", systemImage: "gearshape") }
-                .tag(Tab.settings)
+            Tab("转写", systemImage: "waveform", value: AppTab.transcript) {
+                TranscriptTabView()
+            }
+            Tab("浏览器", systemImage: "globe", value: AppTab.browser) {
+                BrowserTabView()
+            }
+            Tab("设置", systemImage: "gearshape", value: AppTab.settings) {
+                SettingsTabView()
+            }
         }
         .onAppear { applyMode(selected) }
-        // Single-arg onChange keeps us compatible with the iOS 16
-        // deployment target; the iOS 17 two-arg overload is unavailable
-        // on iOS 16 and we don't need the old-value here.
-        .onChange(of: selected) { new in applyMode(new) }
+        .onChange(of: selected) { _, new in applyMode(new) }
     }
 
-    private func applyMode(_ tab: Tab) {
+    private func applyMode(_ tab: AppTab) {
         // Browser tab → webview injection; everything else → pasteboard
         // only. Setting this synchronously means the very first ASR
         // partial after a tab switch already targets the right place.

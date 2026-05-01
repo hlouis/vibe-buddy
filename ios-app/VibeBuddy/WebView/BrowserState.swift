@@ -31,7 +31,30 @@ import WebKit
 @MainActor
 final class BrowserState {
 
-    let page: WebPage
+    // Lazily constructed on first access — must NOT be made eager.
+    // Constructing a WebPage spawns the WebContent helper process. On
+    // iPadOS 26 that helper can't acquire long-lived RBS assertions
+    // (the app doesn't carry the `com.apple.developer.web-browser-
+    // engine.*` entitlements Safari does), so when WebContent is
+    // spawned without a visible WKWebView holding it, the system kills
+    // and respawns it on a tight loop. The user's first tap into the
+    // browser then lands inside that process-restart window, the
+    // gesture-delay queue picks up a nil UITouch, and UIKit aborts in
+    // -[UIGestureRecognizer _delayTouchesForEvent:inPhase:] →
+    // [__NSArrayM insertObject:atIndex:]. Deferring creation until
+    // BrowserTabView reads `page` means WebContent is born under a
+    // foreground WKWebView assertion and never enters that race.
+    var page: WebPage {
+        if let p = _page { return p }
+        let p = makePage()
+        _page = p
+        return p
+    }
+
+    // @ObservationIgnored because the nil→non-nil transition fires
+    // synchronously inside a body re-evaluation; we don't want to
+    // invalidate the body that just produced our value.
+    @ObservationIgnored private var _page: WebPage?
 
     // What the user typed into the address bar. Diverges from page.url
     // while typing, gets snapped back to the URL on every committed
@@ -44,15 +67,16 @@ final class BrowserState {
     // navigation errors, which the bare property doesn't.
     var isLoading: Bool = false
 
-    // Read-through to WebPage. Defining these as computed (vs
-    // duplicating into stored @Observable copies) means there's exactly
-    // one source of truth — eliminates the "two mirrors drift" class of
-    // bugs the old KVO scaffolding was prone to.
-    var currentURL: URL? { page.url }
-    var pageTitle: String { page.title }
-    var loadingProgress: Double { page.estimatedProgress }
-    var canGoBack: Bool { !page.backForwardList.backList.isEmpty }
-    var canGoForward: Bool { !page.backForwardList.forwardList.isEmpty }
+    // Read-through to WebPage *without* forcing creation — the
+    // VibeBuddyApp front-app status pipe polls these on app launch,
+    // long before the user opens the browser tab, so they must not be
+    // the thing that triggers WebContent. Defaults match what an empty
+    // WebPage would report.
+    var currentURL: URL? { _page?.url }
+    var pageTitle: String { _page?.title ?? "" }
+    var loadingProgress: Double { _page?.estimatedProgress ?? 0 }
+    var canGoBack: Bool { _page.map { !$0.backForwardList.backList.isEmpty } ?? false }
+    var canGoForward: Bool { _page.map { !$0.backForwardList.forwardList.isEmpty } ?? false }
 
     // The injector reads these via a callback wired up at init time;
     // BrowserState itself just funnels JS focus messages through.
@@ -64,6 +88,18 @@ final class BrowserState {
     private let focusBridge = FocusBridge()
 
     init() {
+        // Bridge callback wired up here; makePage() attaches the bridge
+        // to the user content controller whenever the page is finally
+        // constructed.
+        focusBridge.onMessage = { [weak self] body in
+            guard let self else { return }
+            let descriptor = (body["focus"] as? String) ?? ""
+            let injectable = (body["injectable"] as? Bool) ?? false
+            self.onFocusMessage?(descriptor, injectable)
+        }
+    }
+
+    private func makePage() -> WebPage {
         var cfg = WebPage.Configuration()
 
         // Inject our focus-tracker into every page at document end so
@@ -90,15 +126,20 @@ final class BrowserState {
         ucc.add(focusBridge, name: "vbFocus")
         cfg.userContentController = ucc
 
-        self.page = WebPage(configuration: cfg)
+        let p = WebPage(configuration: cfg)
 
-        // Bridge forwards messages back here once self exists.
-        focusBridge.onMessage = { [weak self] body in
-            guard let self else { return }
-            let descriptor = (body["focus"] as? String) ?? ""
-            let injectable = (body["injectable"] as? Bool) ?? false
-            self.onFocusMessage?(descriptor, injectable)
-        }
+        // Make this WebView visible to Mac Safari's Web Inspector. Since
+        // iOS 16.4, WKWebView (and by extension the iOS 26 WebPage) is
+        // not inspectable by default — without this flag the page does
+        // not appear under Develop → [device] in Safari, which makes
+        // diagnosing chat-site key dispatch failures basically
+        // impossible. Debug-only: never ship a production build that
+        // exposes user pages to anyone with a USB cable.
+        #if DEBUG
+        p.isInspectable = true
+        #endif
+
+        return p
     }
 
     // MARK: navigation API
@@ -111,21 +152,24 @@ final class BrowserState {
     }
 
     func goBack() {
-        guard let item = page.backForwardList.backList.last else { return }
-        consumeNavigationEvents(page.load(item))
+        guard let p = _page,
+              let item = p.backForwardList.backList.last else { return }
+        consumeNavigationEvents(p.load(item))
     }
 
     func goForward() {
-        guard let item = page.backForwardList.forwardList.first else { return }
-        consumeNavigationEvents(page.load(item))
+        guard let p = _page,
+              let item = p.backForwardList.forwardList.first else { return }
+        consumeNavigationEvents(p.load(item))
     }
 
     func reload() {
-        consumeNavigationEvents(page.reload())
+        guard let p = _page else { return }
+        consumeNavigationEvents(p.reload())
     }
 
     func stop() {
-        page.stopLoading()
+        _page?.stopLoading()
         isLoading = false
     }
 
