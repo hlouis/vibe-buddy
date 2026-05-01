@@ -72,6 +72,12 @@ final class WebViewInjector: ObservableObject, TextHandler {
     // events do not pop the soft keyboard until the user toggles it on.
     @Published var keyboardSuppressed: Bool = true
 
+    // Resolves the current per-site policy table at dispatch time.
+    // Wired to PolicyStore by VibeBuddyApp so user-edited policies take
+    // effect on the next BtnA press without restarting; defaults to
+    // the bundled table so unit tests don't need to construct a store.
+    var policyProvider: () -> [SiteKeyPolicy] = { SiteKeyPolicy.defaults }
+
     // Coalescing in-flight callJavaScript calls.
     private var inFlight: Bool = false
     private var pending: String?
@@ -120,14 +126,15 @@ final class WebViewInjector: ObservableObject, TextHandler {
     }
 
     func sendEnter() {
-        // BtnA double-tap: insert a newline into the focused element.
-        // For textarea this is a literal "\n"; for contenteditable
-        // execCommand('insertText','\n') generally lands as <br>, which
-        // is what the user expects from a soft return. Newer rich
-        // editors might intercept Enter for "send message" — that's
-        // their prerogative; we still try.
-        applyOp(deleteCount: 0, insertText: "\n")
-        // Cursor moved on; mirror no longer maps onto field contents.
+        // BtnA short-press: dispatch the per-site action. The policy
+        // table comes from policyProvider so user-edited rules in the
+        // settings UI take effect on the next press without an app
+        // restart.
+        let host = page?.url?.host
+        let policy = SiteKeyPolicy.resolve(host: host, table: policyProvider())
+        dispatchKeyAction(policy)
+        // Caret moved (or the form just submitted) — either way, the
+        // mirror no longer maps onto field contents.
         mirror = ""
     }
 
@@ -194,6 +201,29 @@ final class WebViewInjector: ObservableObject, TextHandler {
             return
         }
         applyOp(deleteCount: diff.deleteCount, insertText: diff.insertText)
+    }
+
+    // BtnA dispatch goes through its own callJavaScript instead of
+    // applyOp so the streaming-text inFlight/pending coalescer doesn't
+    // get tangled up with one-shot key events. The race between an
+    // in-flight ASR partial and a BtnA press is identical to the
+    // pre-policy code (both used to fire callJavaScript without
+    // mutual exclusion); not making it worse here.
+    private func dispatchKeyAction(_ policy: SiteKeyPolicy) {
+        guard let page = page else { return }
+        let args = policy.dispatchArguments()
+        Task { @MainActor [weak self] in
+            do {
+                let result = try await page.callJavaScript(
+                    InjectionScript.dispatchKeyAction,
+                    arguments: args
+                )
+                self?.handle(result: result)
+            } catch {
+                self?.lastResult = .exception(error.localizedDescription)
+                NSLog("[wv] dispatchKey error: %@", error.localizedDescription)
+            }
+        }
     }
 
     private func applyOp(deleteCount: Int, insertText: String) {

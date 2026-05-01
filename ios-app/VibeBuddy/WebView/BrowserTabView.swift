@@ -171,6 +171,20 @@ struct BrowserTabView: View {
                     .frame(width: 44, height: 36)
                     .foregroundStyle(injector.keyboardSuppressed ? .secondary : Color.accentColor)
             }
+
+            #if DEBUG
+            // Debug-only "fire BtnA" trigger so policy edits can be
+            // tested without picking up the M5Stack hardware. Calls
+            // exactly the same path BLEController hits on a real
+            // newline edit action. Stripped from Release builds.
+            Button {
+                injector.sendEnter()
+            } label: {
+                Image(systemName: "bolt.circle")
+                    .frame(width: 44, height: 36)
+                    .foregroundStyle(.orange)
+            }
+            #endif
         }
         .font(.body.weight(.medium))
         .padding(.horizontal, 8)

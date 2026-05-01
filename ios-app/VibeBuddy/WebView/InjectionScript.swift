@@ -203,6 +203,117 @@ enum InjectionScript {
     return { ok: true, focus: tag };
     """#
 
+    // BtnA short-press dispatch. Receives a `mode` plus a flat bag of
+    // mode-specific arguments (see SiteKeyPolicy.dispatchArguments).
+    // Four branches, matching the four KeyAction cases:
+    //
+    //   • mode === 'insertText'  — write the given string at the caret
+    //     using the value-setter / execCommand fallback. Bypasses
+    //     isTrusted; the only path that reliably "types" into a
+    //     vanilla <textarea>.
+    //   • mode === 'keyEvent'    — synthesize a keydown/keyup pair on
+    //     the focused element. isTrusted is false (synthesized events
+    //     can't be trusted by design); React-based UIs that only
+    //     inspect e.key / e.shiftKey react, sites that gate on
+    //     isTrusted silently swallow it.
+    //   • mode === 'beforeInput' — dispatch a single 'beforeinput'
+    //     InputEvent with the requested inputType. ProseMirror / Slate
+    //     editors that ignore synthetic KeyboardEvents typically still
+    //     honour this path.
+    //   • mode === 'click'       — querySelector + .click() on a
+    //     site-specific target element. Doesn't require a focused
+    //     input, so this branch runs *before* the focus guard.
+    //
+    // All arguments are referenced unconditionally; the Swift side
+    // sends a fully-populated dict so no branch hits a ReferenceError.
+    static let dispatchKeyAction: String = #"""
+    function focused() {
+        let el = document.activeElement;
+        while (el && el.shadowRoot && el.shadowRoot.activeElement) {
+            el = el.shadowRoot.activeElement;
+        }
+        return el;
+    }
+    // Click is selector-driven, not focus-driven — handle it before
+    // the focus guard so it works even when nothing is focused.
+    if (mode === 'click') {
+        const target = document.querySelector(selector);
+        if (!target) {
+            return { ok: false, reason: 'no-target', selector: selector };
+        }
+        try {
+            target.click();
+            const targetDesc = target.tagName + (target.id ? '#' + target.id : '');
+            return { ok: true, mode: 'click', focus: targetDesc };
+        } catch (e) {
+            return { ok: false, reason: 'exception', error: String(e) };
+        }
+    }
+    const el = focused();
+    if (!el || el === document.body) {
+        return { ok: false, reason: 'no-focus' };
+    }
+    const tag = el.tagName;
+    const tagDesc = tag + (el.id ? '#' + el.id : '');
+    try {
+        if (mode === 'insertText') {
+            if (tag === 'INPUT' || tag === 'TEXTAREA') {
+                const proto = (tag === 'INPUT')
+                    ? HTMLInputElement.prototype
+                    : HTMLTextAreaElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                const cur = el.value || '';
+                const caret = (typeof el.selectionStart === 'number')
+                    ? el.selectionStart : cur.length;
+                const newVal = cur.slice(0, caret) + insertText + cur.slice(caret);
+                setter.call(el, newVal);
+                const newCaret = caret + insertText.length;
+                try { el.setSelectionRange(newCaret, newCaret); } catch (e) {}
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, inputType: 'insertText', data: insertText
+                }));
+                return { ok: true, mode: 'insertText', focus: tagDesc };
+            }
+            if (el.isContentEditable) {
+                el.focus();
+                document.execCommand('insertText', false, insertText);
+                return { ok: true, mode: 'insertText', focus: tagDesc };
+            }
+            return { ok: false, reason: 'unsupported', focus: tagDesc };
+        }
+        if (mode === 'keyEvent') {
+            const init = {
+                key: key,
+                code: code || key,
+                keyCode: keyCode || 0,
+                which: keyCode || 0,
+                shiftKey: !!shiftKey,
+                ctrlKey:  !!ctrlKey,
+                altKey:   !!altKey,
+                metaKey:  !!metaKey,
+                bubbles: true,
+                cancelable: true,
+            };
+            const defaulted = el.dispatchEvent(new KeyboardEvent('keydown', init));
+            el.dispatchEvent(new KeyboardEvent('keyup', init));
+            return { ok: true, mode: 'keyEvent', defaulted: defaulted, focus: tagDesc };
+        }
+        if (mode === 'beforeInput') {
+            const ev = new InputEvent('beforeinput', {
+                bubbles: true,
+                cancelable: true,
+                inputType: inputType || 'insertLineBreak',
+                data: data || null,
+            });
+            el.dispatchEvent(ev);
+            return { ok: true, mode: 'beforeInput', focus: tagDesc };
+        }
+        return { ok: false, reason: 'unknown-mode', focus: tagDesc };
+    } catch (e) {
+        return { ok: false, reason: 'exception', error: String(e) };
+    }
+    """#
+
     // Hardware "clear all" button — wipe the entire focused field, not
     // just our mirror. No arguments needed.
     static let clearAll: String = #"""

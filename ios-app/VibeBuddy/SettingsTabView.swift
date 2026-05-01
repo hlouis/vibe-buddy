@@ -82,6 +82,18 @@ struct SettingsTabView: View {
                     .foregroundColor(.accentColor)
                 }
 
+                Section {
+                    NavigationLink {
+                        KeyPolicyListView()
+                    } label: {
+                        Label("按键策略", systemImage: "keyboard")
+                    }
+                } header: {
+                    Text("硬件按键")
+                } footer: {
+                    Text("配置浏览器模式下 BtnA 短按在不同站点的行为：发送、换行、点击发送按钮等。")
+                }
+
                 Section("关于") {
                     LabeledContent("版本", value: appVersion)
                     LabeledContent("浏览器模式") {

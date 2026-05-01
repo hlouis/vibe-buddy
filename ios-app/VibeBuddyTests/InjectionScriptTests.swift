@@ -64,6 +64,70 @@ final class InjectionScriptTests: XCTestCase {
         XCTAssertFalse(s.contains("JSON.stringify"))
     }
 
+    // MARK: dispatchKeyAction
+
+    func testDispatchKeyActionHandlesAllFourModes() {
+        // The JS payload dispatches on a `mode` string injected as a
+        // local. SiteKeyPolicy.dispatchArguments produces four values
+        // for that field; if a refactor drops any branch, BtnA on the
+        // affected sites would silently fail with no log.
+        let s = InjectionScript.dispatchKeyAction
+        XCTAssertTrue(s.contains("'insertText'"))
+        XCTAssertTrue(s.contains("'keyEvent'"))
+        XCTAssertTrue(s.contains("'beforeInput'"))
+        XCTAssertTrue(s.contains("'click'"))
+    }
+
+    func testClickBranchUsesQuerySelector() {
+        // Click is the escape hatch for sites that gate submit on
+        // isTrusted; we don't try to forge a key event, we locate
+        // the actual button. querySelector + .click() is the
+        // contract — if anyone refactors to find-by-id-only or drops
+        // the branch entirely, sites configured with .click()
+        // policies would silently no-op.
+        let s = InjectionScript.dispatchKeyAction
+        XCTAssertTrue(s.contains("querySelector"))
+        XCTAssertTrue(s.contains(".click()"))
+        XCTAssertTrue(s.contains("'no-target'"),
+                      "click branch must report missing element rather than crashing")
+    }
+
+    func testDispatchKeyActionUsesKeyboardAndInputEvents() {
+        // keyEvent branch must construct real KeyboardEvent (not a
+        // generic Event); beforeInput branch must dispatch InputEvent
+        // with the inputType property — those are exactly the shapes
+        // chat-site editors check for.
+        let s = InjectionScript.dispatchKeyAction
+        XCTAssertTrue(s.contains("KeyboardEvent"))
+        XCTAssertTrue(s.contains("InputEvent"))
+        XCTAssertTrue(s.contains("'beforeinput'"))
+        XCTAssertTrue(s.contains("inputType"))
+    }
+
+    func testDispatchKeyActionGuardsNoFocus() {
+        // Same protocol as the other payloads: returning ok=false with
+        // a 'no-focus' reason lets the Swift status bar show "无焦点"
+        // instead of an opaque exception.
+        let s = InjectionScript.dispatchKeyAction
+        XCTAssertTrue(s.contains("'no-focus'"))
+        XCTAssertFalse(s.contains("JSON.stringify"))
+    }
+
+    func testDispatchKeyActionReadsAllNamedArguments() {
+        // WebKit injects every key from the Swift dictionary as a
+        // local in the function body. The JS unconditionally references
+        // these names — if SiteKeyPolicy.dispatchArguments stops
+        // populating any of them, the body throws ReferenceError before
+        // even reaching the mode switch.
+        let s = InjectionScript.dispatchKeyAction
+        for name in ["mode", "insertText", "key", "code", "keyCode",
+                     "shiftKey", "ctrlKey", "altKey", "metaKey",
+                     "inputType", "data", "selector"] {
+            XCTAssertTrue(s.contains(name),
+                          "dispatchKeyAction must reference `\(name)`")
+        }
+    }
+
     // MARK: focusTracker
 
     func testFocusTrackerInstallsListener() {

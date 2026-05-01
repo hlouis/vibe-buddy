@@ -11,6 +11,7 @@ struct VibeBuddyApp: App {
     // .environment(_:) modifier — not @StateObject / .environmentObject.
     @State private var browser: BrowserState
     @StateObject private var bookmarks: BookmarkStore
+    @StateObject private var policies: PolicyStore
     @StateObject private var router: TextRouter
     @StateObject private var ble: BLEController
     @Environment(\.scenePhase) private var scenePhase
@@ -27,13 +28,23 @@ struct VibeBuddyApp: App {
         let inj = WebViewInjector()
         let br = BrowserState()
         let bm = BookmarkStore()
+        let ps = PolicyStore()
         let rt = TextRouter(pasteboard: pb, webview: inj)
+
+        // Each BtnA press resolves against the current store contents,
+        // so user edits take effect immediately without a restart.
+        // Captured weakly to avoid extending PolicyStore's lifetime
+        // through the injector's closure.
+        inj.policyProvider = { [weak ps] in
+            ps?.items ?? SiteKeyPolicy.defaults
+        }
 
         _state = StateObject(wrappedValue: st)
         _pasteboard = StateObject(wrappedValue: pb)
         _injector = StateObject(wrappedValue: inj)
         _browser = State(wrappedValue: br)
         _bookmarks = StateObject(wrappedValue: bm)
+        _policies = StateObject(wrappedValue: ps)
         _router = StateObject(wrappedValue: rt)
         _ble = StateObject(wrappedValue: BLEController(textHandler: rt))
     }
@@ -46,6 +57,7 @@ struct VibeBuddyApp: App {
                 .environmentObject(injector)
                 .environment(browser)
                 .environmentObject(bookmarks)
+                .environmentObject(policies)
                 .environmentObject(router)
                 .environmentObject(ble)
                 .onAppear { ble.bind(state: state) }
