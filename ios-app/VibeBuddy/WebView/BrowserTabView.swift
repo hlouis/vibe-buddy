@@ -8,10 +8,24 @@ import VibeBuddyCore
 // injection mode, AppState surfaces ASR partial text into the status
 // bar.
 //
+// On iPad the same view is used as the always-on detail of the split
+// shell, with `chrome = .toolbarOnly`. In that mode the bottom nav row
+// and status bar are stripped — the sidebar already shows the status
+// content, and back/forward swipe gestures replace the nav buttons.
+//
 // The view also signals the WebViewInjector to attach / detach when it
 // appears / disappears so the injector only holds a webview reference
 // while the user is actually looking at the browser tab.
 struct BrowserTabView: View {
+
+    // .full → original layout (iPhone tab).
+    // .toolbarOnly → only the address bar + WebView; sidebar shell
+    //   draws status & controls itself, and back/forward swipe replaces
+    //   the dropped nav buttons.
+    enum Chrome { case full, toolbarOnly }
+
+    var chrome: Chrome = .full
+
     @EnvironmentObject var state: AppState
     // BrowserState is @Observable (wraps the iOS 26 WebPage); the
     // others are still ObservableObject + @Published.
@@ -28,24 +42,22 @@ struct BrowserTabView: View {
     @AppStorage("lastBrowserURL") private var lastURL: String = "https://claude.ai/new"
 
     var body: some View {
-        VStack(spacing: 0) {
-            addressBar
-            ZStack(alignment: .top) {
-                // SwiftUI-native WebView (iOS 26+). Replaces the old
-                // UIViewRepresentable bridge — no more touch-event
-                // crashes inside UIGestureRecognizer because we're not
-                // wedging a UIKit view into SwiftUI's hit-test chain
-                // any more, the system owns the integration end-to-end.
-                WebView(browser.page)
-                    .ignoresSafeArea(edges: .horizontal)
-                if browser.isLoading {
-                    ProgressView(value: browser.loadingProgress)
-                        .progressViewStyle(.linear)
-                        .tint(.accentColor)
+        Group {
+            if chrome == .full {
+                VStack(spacing: 0) {
+                    addressBar
+                    webContent
+                    navToolbar
+                    BrowserStatusBar(expanded: $statusExpanded)
                 }
+            } else {
+                // toolbarOnly: no in-body address bar — fold it into
+                // the parent NavigationSplitView's detail toolbar so
+                // we don't double up on chrome rows.
+                webContent
+                    .toolbar { addressToolbar }
+                    .toolbarBackground(.thinMaterial, for: .navigationBar)
             }
-            navToolbar
-            StatusBar(expanded: $statusExpanded)
         }
         .sheet(isPresented: $showBookmarks) {
             BookmarksSheet { url in
@@ -74,7 +86,27 @@ struct BrowserTabView: View {
         }
     }
 
-    // MARK: address bar
+    // MARK: web content (shared by both chrome modes)
+
+    private var webContent: some View {
+        ZStack(alignment: .top) {
+            // SwiftUI-native WebView (iOS 26+). Replaces the old
+            // UIViewRepresentable bridge — no more touch-event crashes
+            // inside UIGestureRecognizer because we're not wedging a
+            // UIKit view into SwiftUI's hit-test chain any more, the
+            // system owns the integration end-to-end.
+            WebView(browser.page)
+                .ignoresSafeArea(edges: .horizontal)
+                .webViewBackForwardNavigationGestures(.enabled)
+            if browser.isLoading {
+                ProgressView(value: browser.loadingProgress)
+                    .progressViewStyle(.linear)
+                    .tint(.accentColor)
+            }
+        }
+    }
+
+    // MARK: address bar (iPhone .full layout — bar at the top of the VStack)
 
     private var addressBar: some View {
         // @Bindable shim is the @Observable-era replacement for the old
@@ -126,7 +158,55 @@ struct BrowserTabView: View {
         .background(.thinMaterial)
     }
 
-    // MARK: nav toolbar
+    // MARK: address toolbar (iPad .toolbarOnly — slots into the
+    // NavigationSplitView's detail navigation bar so the in-body
+    // address row disappears entirely).
+
+    @ToolbarContentBuilder
+    private var addressToolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            Button {
+                showBookmarks = true
+            } label: {
+                Image(systemName: "bookmark")
+            }
+        }
+        ToolbarItem(placement: .principal) {
+            urlField
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+            if browser.isLoading {
+                Button { browser.stop() } label: {
+                    Image(systemName: "xmark")
+                }
+            } else {
+                Button { browser.reload() } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+            }
+        }
+    }
+
+    private var urlField: some View {
+        @Bindable var browser = browser
+        return HStack(spacing: 6) {
+            Image(systemName: browser.currentURL?.scheme == "https" ? "lock.fill" : "globe")
+                .foregroundStyle(.secondary)
+                .font(.caption)
+            TextField("URL 或关键词", text: $browser.addressBarText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+                .submitLabel(.go)
+                .onSubmit { browser.load(browser.addressBarText) }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.gray.opacity(0.12), in: Capsule())
+        .frame(minWidth: 320, idealWidth: 640, maxWidth: 900)
+    }
+
+    // MARK: nav toolbar (iPhone .full only)
 
     private var navToolbar: some View {
         HStack(spacing: 4) {
@@ -142,13 +222,56 @@ struct BrowserTabView: View {
 
             Spacer()
 
-            modeBadge
+            BrowserFocusBadge()
 
             Spacer()
 
+            BrowserInjectionButtons()
+        }
+        .font(.body.weight(.medium))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(.thinMaterial)
+    }
+}
+
+// MARK: - Shared chrome subviews (used by iPhone navToolbar + iPad sidebar)
+
+// Focus state pill ("未识别焦点" / "TEXTAREA#input" + colored dot).
+struct BrowserFocusBadge: View {
+    @EnvironmentObject var injector: WebViewInjector
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(badgeColor).frame(width: 7, height: 7)
+            Text(badgeText)
+                .font(.caption.monospaced())
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.gray.opacity(0.10), in: Capsule())
+    }
+
+    private var badgeColor: Color {
+        injector.focusInjectable ? .green : .orange
+    }
+
+    private var badgeText: String {
+        injector.focusInfo.isEmpty ? "未识别焦点" : injector.focusInfo
+    }
+}
+
+// Paste-clipboard / toggle-keyboard / DEBUG-fire-Enter button row.
+// Reused unchanged in iPhone navToolbar and iPad sidebar footer.
+struct BrowserInjectionButtons: View {
+    @EnvironmentObject var injector: WebViewInjector
+
+    var body: some View {
+        HStack(spacing: 4) {
             // Quick "drop current pasteboard into the page" — useful
-            // when the auto-injection lost focus and you want to paste
-            // the latest transcript without leaving the app.
+            // when auto-injection lost focus and you want to paste the
+            // latest transcript without leaving the app.
             Button {
                 let s = UIPasteboard.general.string ?? ""
                 if !s.isEmpty {
@@ -175,8 +298,8 @@ struct BrowserTabView: View {
             #if DEBUG
             // Debug-only "fire BtnA" trigger so policy edits can be
             // tested without picking up the M5Stack hardware. Calls
-            // exactly the same path BLEController hits on a real
-            // newline edit action. Stripped from Release builds.
+            // exactly the same path BLEController hits on a real newline
+            // edit action. Stripped from Release builds.
             Button {
                 injector.sendEnter()
             } label: {
@@ -186,38 +309,14 @@ struct BrowserTabView: View {
             }
             #endif
         }
-        .font(.body.weight(.medium))
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(.thinMaterial)
-    }
-
-    private var modeBadge: some View {
-        HStack(spacing: 6) {
-            Circle().fill(badgeColor).frame(width: 7, height: 7)
-            Text(badgeText)
-                .font(.caption.monospaced())
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(.gray.opacity(0.10), in: Capsule())
-    }
-
-    private var badgeColor: Color {
-        if injector.focusInjectable { return .green }
-        return .orange
-    }
-
-    private var badgeText: String {
-        if injector.focusInfo.isEmpty { return "未识别焦点" }
-        return injector.focusInfo
     }
 }
 
 // MARK: - Status bar (collapsible)
-
-private struct StatusBar: View {
+//
+// Promoted from the file-private `StatusBar` so the iPad shell can drop
+// the same view into its sidebar footer.
+struct BrowserStatusBar: View {
     @EnvironmentObject var state: AppState
     @EnvironmentObject var router: TextRouter
     @EnvironmentObject var injector: WebViewInjector
@@ -312,7 +411,7 @@ private struct StatusBar: View {
 
 // MARK: - Bookmarks sheet
 
-private struct BookmarksSheet: View {
+struct BookmarksSheet: View {
     @EnvironmentObject var bookmarks: BookmarkStore
     @Environment(\.dismiss) private var dismiss
     let onPick: (String) -> Void
