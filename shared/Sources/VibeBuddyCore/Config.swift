@@ -83,6 +83,47 @@ public struct Config {
             return nil
         }
     }
+
+    // Atomic write of the JSON config file. Creates the parent
+    // directory if needed (~/.config/vibe-buddy/). The settings UI
+    // calls this; nothing else writes to the config file.
+    @discardableResult
+    public static func save(appID: String,
+                            accessToken: String,
+                            resourceID: String) throws -> URL {
+        let url = configURL()
+        let dir = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: dir, withIntermediateDirectories: true, attributes: nil
+        )
+        let raw: [String: String] = [
+            "app_id": appID,
+            "access_token": accessToken,
+            "resource_id": resourceID,
+        ]
+        let data = try JSONSerialization.data(
+            withJSONObject: raw, options: [.prettyPrinted, .sortedKeys]
+        )
+        try data.write(to: url, options: .atomic)
+        // Tighten file mode — the access token is a credential, no
+        // reason for it to be group/world-readable.
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o600)],
+            ofItemAtPath: url.path
+        )
+        NSLog("[config] saved -> %@", url.path)
+        return url
+    }
+
+    // Remove the config file. Used by the "delete" button in Settings
+    // when the user wants to start over (also handy in tests).
+    public static func clear() throws {
+        let url = configURL()
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+            NSLog("[config] cleared %@", url.path)
+        }
+    }
     #endif
 
     // MARK: iOS — UserDefaults

@@ -42,12 +42,17 @@ struct ContentView: View {
     @ViewBuilder private var warnings: some View {
         VStack(alignment: .leading, spacing: 6) {
             if state.configMissing {
-                warning(
-                    icon: "exclamationmark.triangle.fill",
-                    color: .orange,
-                    title: "Doubao config missing",
-                    detail: "Create \(Config.sourceDescription) — see README."
-                )
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Doubao config missing").font(.callout).bold()
+                        Text("ASR 功能需要先填入 Doubao 凭证。")
+                            .font(.caption).foregroundColor(.secondary)
+                        Button("打开设置…") { openSettingsWindow() }
+                            .controlSize(.small)
+                    }
+                }
             }
             if !state.accessibilityTrusted {
                 HStack(alignment: .top, spacing: 8) {
@@ -303,6 +308,18 @@ struct ContentView: View {
     private func openAccessibilityPane() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    // SwiftUI doesn't expose a typed "open Settings scene" API on
+    // macOS 14 — the cross-version trick is to send the standard
+    // "showSettingsWindow:" Cocoa selector, which the Settings { }
+    // scene installs as the Cmd+, action.
+    private func openSettingsWindow() {
+        if #available(macOS 14, *) {
+            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        } else {
+            NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
         }
     }
 }
