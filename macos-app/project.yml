@@ -41,6 +41,9 @@ targets:
         PRODUCT_NAME: VibeBuddy
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "Vibe Buddy needs Bluetooth to connect to your M5Stack hardware."
+        # Mic mode (no hardware device): falls back to the system
+        # microphone, gated by a global Right Option PTT hotkey.
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Vibe Buddy uses the system microphone when no VibeBuddy hardware is connected, so push-to-talk transcription works on any Mac."
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.utilities"
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
         INFOPLIST_KEY_NSPrincipalClass: NSApplication
@@ -48,4 +51,9 @@ targets:
         # Disable sandbox during dev so Bluetooth works without extra entitlements.
         # When we ship we'll opt back in with com.apple.security.device.bluetooth.
         ENABLE_APP_SANDBOX: NO
-        CODE_SIGN_ENTITLEMENTS: ""
+        # Hardened Runtime is on (default for Apple Development signing).
+        # Microphone access under Hardened Runtime requires the
+        # com.apple.security.device.audio-input entitlement — without it
+        # AVCaptureDevice.requestAccess(.audio) is silently denied and
+        # the app never shows up in System Settings → Microphone.
+        CODE_SIGN_ENTITLEMENTS: VibeBuddy/VibeBuddy.entitlements

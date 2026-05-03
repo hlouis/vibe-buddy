@@ -42,6 +42,35 @@ public final class AppState: ObservableObject {
         }
     }
 
+    // Audio source the user has selected. The macOS host writes this
+    // through AudioSourceCoordinator; iOS leaves it at .bluetooth (its
+    // only supported source). Surfaced here so ContentView can read it
+    // without depending on macOS-only types.
+    public enum AudioSource: String, Equatable, CaseIterable {
+        case bluetooth   // M5Stack VibeBuddy device over BLE
+        case mic         // System microphone + global hotkey PTT
+    }
+
+    public enum MicAuth: Equatable {
+        case unknown
+        case granted
+        case denied
+        case notDetermined
+    }
+
+    @Published public var audioSource: AudioSource = .bluetooth
+    @Published public var hotkeyHint: String = "按住 Right Option ⌥ 说话（短按取消）"
+    @Published public var hotkeyEnabled: Bool = false
+    @Published public var hotkeyError: String = ""
+    @Published public var micAuth: MicAuth = .unknown
+    @Published public var micRunning: Bool = false
+    // Input Monitoring (kIOHIDRequestTypeListenEvent) is a separate
+    // TCC service from Accessibility — required for our CGEventTap to
+    // observe Right Option key edges. Tracked independently so the UI
+    // can show three distinct stages (unknown → prompted → granted)
+    // and react to grants made outside the app (poll on focus regain).
+    @Published public var inputMonitoringAuth: MicAuth = .unknown
+
     @Published public var link: LinkStatus = .idle
     @Published public var linkParams = LinkParams()
     @Published public var lastJSON: String = ""

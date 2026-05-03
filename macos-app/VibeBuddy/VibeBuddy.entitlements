@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    Hardened Runtime is on (ENABLE_HARDENED_RUNTIME=YES) and the app
+    sandbox is off. Under that combination, every resource-access
+    permission must be explicitly enabled here, otherwise the runtime
+    silently blocks the request before TCC ever sees it — meaning the
+    app never appears in System Settings → Privacy & Security.
+
+    Bluetooth and Accessibility don't need entitlements (they're not
+    Hardened Runtime resources), so the BLE path worked without any of
+    these. The microphone IS gated by Hardened Runtime, hence the
+    entitlement below.
+    -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

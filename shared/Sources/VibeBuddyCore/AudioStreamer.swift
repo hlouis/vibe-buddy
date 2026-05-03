@@ -48,8 +48,18 @@ public final class AudioStreamer {
     // starts flowing, the press transient is long gone. Releasing, on
     // the other hand, produces a click that is still captured before we
     // see the stop event, so we still need to drop the trailing window.
-    private static let tailTrimMs: Int = 200
-    private var trimBytes: Int { AudioStreamer.tailTrimMs * sampleRate * 2 / 1000 }
+    //
+    // This is BLE-specific: the click only exists because the device has
+    // a physical button next to its mic. Mic-mode (system microphone +
+    // global hotkey) has no such transient — and trimming 200 ms there
+    // would clip the user's last syllable. tailTrimMs is therefore set
+    // per-session via handlePTT() / startSession(tailTrimMs:).
+    // `nonisolated` so it can be referenced from default-argument
+    // expressions on @MainActor methods without tripping Swift 6
+    // strict-concurrency diagnostics.
+    public nonisolated static let defaultTailTrimMs: Int = 200
+    private var tailTrimMs: Int = AudioStreamer.defaultTailTrimMs
+    private var trimBytes: Int { tailTrimMs * sampleRate * 2 / 1000 }
     private var tailBuffer = Data()
 
     // ASR requires 100-200 ms chunks; 200 ms is optimal for bigmodel_async.
@@ -94,13 +104,43 @@ public final class AudioStreamer {
 
     public func handleControl(_ line: String) {
         if line.contains("\"event\":\"start\"") {
-            sampleRate = extractInt(from: line, key: "sample_rate") ?? 16000
-            startSession()
+            let sr = extractInt(from: line, key: "sample_rate") ?? 16000
+            handlePTT(.start(sampleRate: sr), tailTrimMs: AudioStreamer.defaultTailTrimMs)
         } else if line.contains("\"event\":\"stop\"") {
-            endSession()
+            handlePTT(.stop)
         } else if line.contains("\"event\":\"cancel\"") {
+            handlePTT(.cancel)
+        }
+    }
+
+    // MARK: source-agnostic PTT entry point
+    //
+    // Both the BLE control-frame path and the macOS hotkey path funnel
+    // through here. The tailTrimMs argument is what makes mic mode work
+    // without clipping speech: BLE passes 200, mic passes 0.
+
+    public func handlePTT(_ event: PTTEvent, tailTrimMs: Int = AudioStreamer.defaultTailTrimMs) {
+        switch event {
+        case .start(let sr):
+            self.sampleRate = sr
+            self.tailTrimMs = max(0, tailTrimMs)
+            startSession()
+        case .stop:
+            endSession()
+        case .cancel:
             cancelSession()
         }
+    }
+
+    // MARK: source-agnostic PCM ingest
+    //
+    // Mic mode has no notion of sequence numbers (AVAudioEngine just
+    // hands us a stream of buffers). Synthesizing matching seqs means
+    // the gap-detection branch in onAudioFrame is a permanent no-op for
+    // mic input — exactly what we want.
+
+    public func ingestPCM(_ pcm: Data) {
+        onAudioFrame(seq: expectedSeq, pcm: pcm)
     }
 
     // MARK: BLE audio-frame hook
@@ -190,7 +230,7 @@ public final class AudioStreamer {
         }
 
         NSLog("[audio] session -> %@ (rate=%d tailTrim=%dms warmup=%dms asrChunk=%dB)",
-              url.path, sampleRate, AudioStreamer.tailTrimMs,
+              url.path, sampleRate, tailTrimMs,
               AudioStreamer.sttWarmupMs, asrChunkBytes)
         onDumpPath?(url.path)
         emit()

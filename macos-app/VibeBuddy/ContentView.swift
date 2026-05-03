@@ -5,14 +5,17 @@ import VibeBuddyCore
 struct ContentView: View {
     @EnvironmentObject var state: AppState
     @EnvironmentObject var ble: BLEController
+    @EnvironmentObject var coord: AudioSourceCoordinator
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             header
             Divider()
             warnings
+            sourceRow
             statusRow
-            if case .connected = state.link { linkParamsRow }
+            if case .connected = state.link, state.audioSource == .bluetooth { linkParamsRow }
+            if state.audioSource == .mic { micRow }
             Divider()
             audioRow
             Divider()
@@ -22,7 +25,7 @@ struct ContentView: View {
             Spacer()
         }
         .padding(20)
-        .frame(minWidth: 560, minHeight: 460)
+        .frame(minWidth: 560, minHeight: 480)
     }
 
     // MARK: sections
@@ -76,6 +79,27 @@ struct ContentView: View {
         }
     }
 
+    // Source picker: Bluetooth (default, hardware device) vs Mic
+    // (system microphone + global hotkey PTT). Switching tears down
+    // any in-flight session and rewires AudioStreamer's input.
+    private var sourceRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: state.audioSource == .bluetooth ? "dot.radiowaves.left.and.right" : "mic.fill")
+                .foregroundColor(state.audioSource == .bluetooth ? .blue : .purple)
+            Picker("音频来源", selection: Binding(
+                get: { state.audioSource },
+                set: { coord.switchTo($0) }
+            )) {
+                Text("VibeBuddy 蓝牙设备").tag(AppState.AudioSource.bluetooth)
+                Text("系统麦克风 (PTT)").tag(AppState.AudioSource.mic)
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 360)
+            Spacer()
+        }
+    }
+
     private var statusRow: some View {
         HStack(spacing: 10) {
             Circle().fill(statusColor).frame(width: 12, height: 12)
@@ -85,6 +109,12 @@ struct ContentView: View {
     }
 
     private var statusColor: Color {
+        if state.audioSource == .mic {
+            if state.micAuth != .granted { return .red }
+            if !state.hotkeyEnabled       { return .yellow }
+            if state.session?.active == true { return .red }
+            return .green
+        }
         switch state.link {
         case .connected:              return .green
         case .connecting, .scanning:  return .yellow
@@ -94,12 +124,89 @@ struct ContentView: View {
     }
 
     private var statusText: String {
+        if state.audioSource == .mic {
+            switch state.micAuth {
+            case .denied:        return "麦克风权限被拒绝 — 前往系统设置开启"
+            case .notDetermined: return "等待麦克风授权"
+            case .granted:
+                if state.session?.active == true {
+                    return "🔴 录音中 · 松开 ⌥ 发送 / 短按取消"
+                }
+                if !state.hotkeyEnabled {
+                    return "麦克风就绪 · 全局快捷键未启用"
+                }
+                return "麦克风就绪 · \(state.hotkeyHint)"
+            case .unknown:       return "正在检查麦克风权限"
+            }
+        }
         switch state.link {
         case .idle:              return "Bluetooth powering up"
         case .scanning:          return "scanning for VibeBuddy-*"
         case .connecting(let n): return "connecting to \(n)"
         case .connected(let n):  return "connected: \(n)"
         case .failed(let s):     return "failed: \(s)"
+        }
+    }
+
+    // Mic-mode-specific subrow: shows two permission gates (mic +
+    // input monitoring) with deep-link buttons. The input-monitoring
+    // gate auto-recovers when the user grants permission and switches
+    // back to this window — see AudioSourceCoordinator.refreshPermissionsOnFocus.
+    @ViewBuilder private var micRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if state.micAuth == .denied {
+                HStack(spacing: 8) {
+                    Image(systemName: "mic.slash.fill").foregroundColor(.red)
+                    Text("VibeBuddy 没有麦克风权限。")
+                        .font(.callout)
+                    Button("打开「麦克风」设置") { coord.openMicSettings() }
+                        .controlSize(.small)
+                }
+            }
+            if state.inputMonitoringAuth != .granted {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: state.inputMonitoringAuth == .denied
+                          ? "keyboard.badge.eye"
+                          : "keyboard.badge.ellipsis")
+                        .foregroundColor(state.inputMonitoringAuth == .denied ? .red : .orange)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(inputMonitoringMessage)
+                            .font(.callout)
+                        Text("授权后回到 VibeBuddy 窗口会自动启用，无需重启 app。")
+                            .font(.caption).foregroundColor(.secondary)
+                        HStack(spacing: 8) {
+                            Button("打开「输入监控」设置") { coord.openInputMonitoringSettings() }
+                                .controlSize(.small)
+                            Button("重试") { coord.retryHotkey() }
+                                .controlSize(.small)
+                        }
+                    }
+                }
+            } else if !state.hotkeyError.isEmpty {
+                // Input monitoring is granted but tap creation still
+                // failed somehow — surface the raw error.
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(state.hotkeyError)
+                            .font(.caption).foregroundColor(.secondary)
+                            .textSelection(.enabled)
+                        Button("重试") { coord.retryHotkey() }
+                            .controlSize(.small)
+                    }
+                }
+            }
+        }
+    }
+
+    private var inputMonitoringMessage: String {
+        switch state.inputMonitoringAuth {
+        case .denied:
+            return "「输入监控」权限被拒绝 — 全局快捷键无法工作。"
+        case .notDetermined, .unknown:
+            return "需要「输入监控」权限来监听 Right Option 全局快捷键。"
+        case .granted:
+            return ""   // not shown
         }
     }
 
@@ -134,7 +241,9 @@ struct ContentView: View {
                 }
             }
         } else {
-            Text("no audio session yet — hold the A button on the device")
+            Text(state.audioSource == .bluetooth
+                 ? "no audio session yet — hold the A button on the device"
+                 : "尚无录音 — 按住 ⌥ Right Option 说话（短按取消）")
                 .font(.callout)
                 .foregroundColor(.secondary)
         }

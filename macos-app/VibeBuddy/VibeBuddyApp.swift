@@ -5,19 +5,32 @@ import VibeBuddyCore
 @main
 struct VibeBuddyApp: App {
     @StateObject private var state = AppState()
-    @StateObject private var ble = BLEController(textHandler: TextInjector())
+    // BLE and the AudioSourceCoordinator share a single BLEController
+    // instance — the coordinator drives mode switching, while BLE keeps
+    // owning its CoreBluetooth stack. Both are constructed in init() so
+    // we can wire the cross-dependency without building anything twice.
+    @StateObject private var ble: BLEController
+    @StateObject private var coord: AudioSourceCoordinator
     // Re-emits the front-app name to the device when the BLE link goes
     // from down -> ready, so the StickS3 gets an initial sync without
     // waiting for the user to switch apps after connecting.
     @State private var linkReadyCancellable: AnyCancellable?
+
+    init() {
+        let bleObj = BLEController(textHandler: TextInjector())
+        _ble = StateObject(wrappedValue: bleObj)
+        _coord = StateObject(wrappedValue: AudioSourceCoordinator(ble: bleObj))
+    }
 
     var body: some Scene {
         WindowGroup("Vibe Buddy") {
             ContentView()
                 .environmentObject(state)
                 .environmentObject(ble)
+                .environmentObject(coord)
                 .onAppear {
                     ble.bind(state: state)
+                    coord.bind(state: state)
                     // Bridge the macOS-only focus-gate signal up to AppState
                     // so ContentView can show "typing paused" when the
                     // session starts with focus on a non-editable control.
