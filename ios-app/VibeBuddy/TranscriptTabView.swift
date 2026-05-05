@@ -8,6 +8,7 @@ import VibeBuddyCore
 struct TranscriptTabView: View {
     @EnvironmentObject var state: AppState
     @EnvironmentObject var pasteboard: PasteboardHandler
+    @EnvironmentObject var coord: AudioSourceCoordinator
 
     @State private var showCopiedToast: Bool = false
 
@@ -18,9 +19,15 @@ struct TranscriptTabView: View {
                     if state.configMissing {
                         configMissingCard
                     }
+                    sourcePicker
                     statusCard
-                    if case .connected = state.link { linkParamsRow }
+                    if case .connected = state.link, state.audioSource == .bluetooth { linkParamsRow }
+                    if state.audioSource == .mic { micPermissionRow }
                     transcriptCard
+                    if state.audioSource == .mic {
+                        MicPTTButton()
+                            .padding(.vertical, 8)
+                    }
                     historyCard
                     debugCard
                 }
@@ -57,6 +64,50 @@ struct TranscriptTabView: View {
         .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
     }
 
+    // Segmented picker between BLE device and system mic. Switching
+    // cancels any in-flight session through the coordinator, then
+    // brings the new pipeline up (asks for mic permission on first
+    // entry). Hidden behind a simple subtitle so non-technical users
+    // can ignore it when they have the device.
+    private var sourcePicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("音频来源").font(.caption).foregroundColor(.secondary)
+            Picker("音频来源", selection: Binding(
+                get: { state.audioSource },
+                set: { coord.switchTo($0) }
+            )) {
+                Label("VibeBuddy 设备", systemImage: "dot.radiowaves.left.and.right")
+                    .tag(AppState.AudioSource.bluetooth)
+                Label("系统麦克风", systemImage: "mic.fill")
+                    .tag(AppState.AudioSource.mic)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+        }
+    }
+
+    // Surfaces the deny / not-determined states with a deep link to
+    // the app's settings pane. Granted is silent — the PTT button
+    // itself is the affordance from there on.
+    @ViewBuilder private var micPermissionRow: some View {
+        if state.micAuth == .denied {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "mic.slash.fill").foregroundColor(.red)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("麦克风权限被拒绝").font(.callout).bold()
+                    Text("请到 系统设置 → VibeBuddy → 麦克风 中开启。")
+                        .font(.caption).foregroundColor(.secondary)
+                    Button("打开设置") { coord.openMicSettings() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+                Spacer()
+            }
+            .padding()
+            .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
     private var statusCard: some View {
         HStack(spacing: 12) {
             Circle().fill(statusColor).frame(width: 12, height: 12)
@@ -70,6 +121,11 @@ struct TranscriptTabView: View {
     }
 
     private var statusColor: Color {
+        if state.audioSource == .mic {
+            if state.micAuth != .granted { return .red }
+            if state.session?.active == true { return .red }
+            return state.micRunning ? .green : .gray
+        }
         switch state.link {
         case .connected:              return .green
         case .connecting, .scanning:  return .yellow
@@ -79,6 +135,16 @@ struct TranscriptTabView: View {
     }
 
     private var statusText: String {
+        if state.audioSource == .mic {
+            switch state.micAuth {
+            case .denied:        return "麦克风权限被拒绝"
+            case .notDetermined: return "等待麦克风授权"
+            case .granted:
+                if state.session?.active == true { return "🔴 录音中" }
+                return state.micRunning ? "麦克风就绪 — 按住下方按钮说话" : "正在启动麦克风…"
+            case .unknown:       return "正在检查麦克风权限"
+            }
+        }
         switch state.link {
         case .idle:              return "蓝牙启动中"
         case .scanning:          return "扫描 VibeBuddy-* 中"
@@ -111,7 +177,9 @@ struct TranscriptTabView: View {
                         : !state.finalText.isEmpty   ? state.finalText
                         : pasteboard.currentText
             if primary.isEmpty {
-                Text("（按住设备 A 按钮开始说话）")
+                Text(state.audioSource == .bluetooth
+                     ? "（按住设备 A 按钮开始说话）"
+                     : "（按住下方按钮开始说话）")
                     .foregroundColor(.secondary).font(.callout)
             } else {
                 Text(primary)

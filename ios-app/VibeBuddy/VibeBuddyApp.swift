@@ -14,6 +14,10 @@ struct VibeBuddyApp: App {
     @StateObject private var policies: PolicyStore
     @StateObject private var router: TextRouter
     @StateObject private var ble: BLEController
+    // Owns the BLE↔mic switch + the iOS button-driven PTT trigger.
+    // Constructed alongside `ble` so both share a single AudioStreamer
+    // instance.
+    @StateObject private var coord: AudioSourceCoordinator
     @Environment(\.scenePhase) private var scenePhase
 
     @MainActor
@@ -39,6 +43,9 @@ struct VibeBuddyApp: App {
             ps?.items ?? SiteKeyPolicy.defaults
         }
 
+        let bleObj = BLEController(textHandler: rt)
+        let cd = AudioSourceCoordinator(ble: bleObj)
+
         _state = StateObject(wrappedValue: st)
         _pasteboard = StateObject(wrappedValue: pb)
         _injector = StateObject(wrappedValue: inj)
@@ -46,7 +53,8 @@ struct VibeBuddyApp: App {
         _bookmarks = StateObject(wrappedValue: bm)
         _policies = StateObject(wrappedValue: ps)
         _router = StateObject(wrappedValue: rt)
-        _ble = StateObject(wrappedValue: BLEController(textHandler: rt))
+        _ble = StateObject(wrappedValue: bleObj)
+        _coord = StateObject(wrappedValue: cd)
     }
 
     var body: some Scene {
@@ -60,7 +68,11 @@ struct VibeBuddyApp: App {
                 .environmentObject(policies)
                 .environmentObject(router)
                 .environmentObject(ble)
-                .onAppear { ble.bind(state: state) }
+                .environmentObject(coord)
+                .onAppear {
+                    ble.bind(state: state)
+                    coord.bind(state: state)
+                }
                 // Mirror "where will my voice land" onto the StickS3.
                 // Pasteboard mode -> the literal label; webview mode ->
                 // the page title (falls back to host, then "Browser").
@@ -74,8 +86,17 @@ struct VibeBuddyApp: App {
                 // WebSocket's receive loop never fires its close callback
                 // and STTService.active stays stuck true. Force a teardown
                 // on backgrounding so the next button press starts clean.
+                // The coordinator additionally tears down the mic engine
+                // (releases AVAudioSession) and re-arms on foreground so
+                // the user can keep using the PTT button without a
+                // restart-the-app dance.
                 .onChange(of: scenePhase) { _, phase in
-                    if phase != .active { ble.audio.cancelSession() }
+                    if phase != .active {
+                        ble.audio.cancelSession()
+                        coord.handleAppBackgrounded()
+                    } else {
+                        coord.handleAppForegrounded()
+                    }
                 }
         }
     }
