@@ -41,15 +41,51 @@ struct BrowserTabView: View {
     @AppStorage("statusBarExpanded") private var statusExpanded: Bool = true
     @AppStorage("lastBrowserURL") private var lastURL: String = "https://claude.ai/new"
 
+    // Safari-style auto-collapse on iPhone (.full chrome). After a page
+    // finishes loading we shrink the top URL row and merge the bottom
+    // nav + status rows into a thin strip; tapping either strip — or
+    // anything that demands user attention (address focus, fresh ASR
+    // partial text) — pops the full chrome back.
+    @State private var chromeCollapsed: Bool = false
+    @FocusState private var addressFocused: Bool
+
     var body: some View {
         Group {
             if chrome == .full {
+                // Skeleton: WebView size is fixed (always == collapsed
+                // layout). The expanded chrome floats on top as overlays
+                // so the WebView viewport never resizes — fixed/sticky
+                // CSS, 100vh, scroll position all stay stable when the
+                // user toggles chrome.
                 VStack(spacing: 0) {
-                    addressBar
+                    collapsedTopStrip
                     webContent
-                    navToolbar
-                    BrowserStatusBar(expanded: $statusExpanded)
+                    collapsedBottomStrip
                 }
+                .overlay(alignment: .top) {
+                    if !chromeCollapsed {
+                        addressBar
+                            // Soft drop shadow downward — sells the
+                            // "floating above webview" feel without
+                            // looking heavy. y:2 so the shadow only
+                            // shows on the bottom edge where chrome
+                            // meets the page.
+                            .shadow(color: .black.opacity(0.10), radius: 6, x: 0, y: 2)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                }
+                .overlay(alignment: .bottom) {
+                    if !chromeCollapsed {
+                        VStack(spacing: 0) {
+                            navToolbar
+                            BrowserStatusBar(expanded: $statusExpanded)
+                        }
+                        // Mirror of the top shadow, cast upward.
+                        .shadow(color: .black.opacity(0.10), radius: 6, x: 0, y: -2)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                }
+                .animation(.easeInOut(duration: 0.22), value: chromeCollapsed)
             } else {
                 // toolbarOnly: no in-body address bar — fold it into
                 // the parent NavigationSplitView's detail toolbar so
@@ -58,6 +94,24 @@ struct BrowserTabView: View {
                     .toolbar { addressToolbar }
                     .toolbarBackground(.thinMaterial, for: .navigationBar)
             }
+        }
+        // Loading edge true→false: page settled, fold the chrome away.
+        .onChange(of: browser.isLoading) { old, new in
+            if old && !new && chrome == .full {
+                chromeCollapsed = true
+            }
+        }
+        // Address bar focus → user is typing a URL, must show full chrome.
+        .onChange(of: addressFocused) { _, focused in
+            if focused { chromeCollapsed = false }
+        }
+        // Live ASR partial: user is dictating, status MUST be visible
+        // so they can see what got transcribed. Never break userspace.
+        .onChange(of: state.partialText) { _, txt in
+            if !txt.isEmpty { chromeCollapsed = false }
+        }
+        .onChange(of: state.asrError) { _, err in
+            if !err.isEmpty { chromeCollapsed = false }
         }
         .sheet(isPresented: $showBookmarks) {
             BookmarksSheet { url in
@@ -106,6 +160,78 @@ struct BrowserTabView: View {
         }
     }
 
+    // MARK: collapsed strips (iPhone .full only — Safari-style auto-hide)
+
+    // Replaces `addressBar` when chrome is collapsed. Single short row
+    // showing only lock + host. Tap anywhere to expand the full chrome.
+    private var collapsedTopStrip: some View {
+        HStack(spacing: 6) {
+            Image(systemName: browser.currentURL?.scheme == "https" ? "lock.fill" : "globe")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(collapsedHostText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 22)
+        .background(.thinMaterial)
+        .contentShape(Rectangle())
+        .onTapGesture { chromeCollapsed = false }
+        .accessibilityLabel("展开浏览器工具栏")
+        .accessibilityAddTraits(.isButton)
+    }
+
+    // Replaces `navToolbar` + `BrowserStatusBar` when collapsed.
+    // Shows only the two indicator dots (link + focus) + a chevron hint.
+    private var collapsedBottomStrip: some View {
+        HStack(spacing: 8) {
+            Circle().fill(collapsedLinkColor).frame(width: 6, height: 6)
+            Circle().fill(collapsedFocusColor).frame(width: 6, height: 6)
+            Text(collapsedFocusText)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            Image(systemName: "chevron.up")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 22)
+        .frame(maxWidth: .infinity)
+        .background(.thinMaterial)
+        .contentShape(Rectangle())
+        .onTapGesture { chromeCollapsed = false }
+        .accessibilityLabel("展开浏览器状态栏")
+        .accessibilityAddTraits(.isButton)
+    }
+
+    private var collapsedHostText: String {
+        if let host = browser.currentURL?.host, !host.isEmpty { return host }
+        return browser.addressBarText.isEmpty ? "—" : browser.addressBarText
+    }
+
+    private var collapsedLinkColor: Color {
+        switch state.link {
+        case .connected:             return .green
+        case .connecting, .scanning: return .yellow
+        case .failed:                return .red
+        case .idle:                  return .gray
+        }
+    }
+
+    private var collapsedFocusColor: Color {
+        injector.focusInjectable ? .green : .orange
+    }
+
+    private var collapsedFocusText: String {
+        injector.focusInfo.isEmpty ? "未识别焦点" : injector.focusInfo
+    }
+
     // MARK: address bar (iPhone .full layout — bar at the top of the VStack)
 
     private var addressBar: some View {
@@ -128,6 +254,7 @@ struct BrowserTabView: View {
                     .foregroundStyle(.secondary)
                     .font(.caption)
                 TextField("URL 或关键词", text: $browser.addressBarText)
+                    .focused($addressFocused)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
@@ -227,6 +354,21 @@ struct BrowserTabView: View {
             Spacer()
 
             BrowserInjectionButtons()
+
+            // Safari-style collapse trigger. Replaces the DEBUG-only
+            // bolt button that used to sit here. Lives in navToolbar
+            // (not BrowserInjectionButtons) because the latter is
+            // reused by the iPad sidebar where chrome collapsing
+            // doesn't apply.
+            Button {
+                addressFocused = false
+                chromeCollapsed = true
+            } label: {
+                Image(systemName: "rectangle.compress.vertical")
+                    .frame(width: 44, height: 36)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityLabel("收起浏览器工具栏")
         }
         .font(.body.weight(.medium))
         .padding(.horizontal, 8)
@@ -295,19 +437,6 @@ struct BrowserInjectionButtons: View {
                     .foregroundStyle(injector.keyboardSuppressed ? .secondary : Color.accentColor)
             }
 
-            #if DEBUG
-            // Debug-only "fire BtnA" trigger so policy edits can be
-            // tested without picking up the M5Stack hardware. Calls
-            // exactly the same path BLEController hits on a real newline
-            // edit action. Stripped from Release builds.
-            Button {
-                injector.sendEnter()
-            } label: {
-                Image(systemName: "bolt.circle")
-                    .frame(width: 44, height: 36)
-                    .foregroundStyle(.orange)
-            }
-            #endif
         }
     }
 }
