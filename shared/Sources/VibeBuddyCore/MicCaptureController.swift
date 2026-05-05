@@ -4,7 +4,6 @@ import Foundation
 // bytes as a Data value. @preconcurrency silences the Swift 6
 // concurrency diagnostics without weakening the actual safety story.
 @preconcurrency import AVFoundation
-import VibeBuddyCore
 
 // MicCaptureController is the system-microphone counterpart to the BLE
 // audio path. It taps the default input node, converts whatever the
@@ -17,13 +16,34 @@ import VibeBuddyCore
 // silently dropping" is done by AudioStreamer.active (toggled by PTT
 // start/stop/cancel). That avoids the 100–300 ms warm-up latency we'd
 // pay if we started the engine on every PTT press.
+//
+// Cross-platform notes:
+// • macOS: AVAudioEngine works directly off the default input device;
+//   no AVAudioSession exists. Permission goes through AVAudioApplication
+//   (iOS 17+/macOS 14+) or the older AVCaptureDevice.requestAccess —
+//   they share the same TCC service so either works.
+// • iOS: AVAudioSession must be configured before the engine starts.
+//   We use category .record + mode .measurement so the system doesn't
+//   apply AGC/voice-processing on top of Doubao's own NS pipeline, plus
+//   .bluetoothHighQualityRecording (iOS 26+) to get full-bandwidth
+//   audio off AirPods instead of the legacy 8 kHz HFP profile.
 @MainActor
-final class MicCaptureController {
+public final class MicCaptureController {
 
-    enum MicError: Error {
+    public enum MicError: Error, LocalizedError {
         case permissionDenied
         case engineFailed(String)
         case formatUnavailable
+        case sessionFailed(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .permissionDenied:        return "Microphone permission denied."
+            case .engineFailed(let m):     return "Audio engine failed: \(m)"
+            case .formatUnavailable:       return "Could not negotiate 16 kHz mono Int16 PCM format."
+            case .sessionFailed(let m):    return "AVAudioSession setup failed: \(m)"
+            }
+        }
     }
 
     // The engine is built lazily on each start() rather than once at
@@ -39,30 +59,43 @@ final class MicCaptureController {
     private let targetSampleRate: Double = 16000
     private var converter: AVAudioConverter?
     private weak var audio: AudioStreamer?
-    private(set) var running = false
+    public private(set) var running = false
 
-    init(audio: AudioStreamer) {
+    public init(audio: AudioStreamer) {
         self.audio = audio
     }
 
     // MARK: permission
 
-    static var permission: AVAuthorizationStatus {
-        AVCaptureDevice.authorizationStatus(for: .audio)
+    // AVAudioApplication is the iOS 17+ / macOS 14+ recommended entry
+    // point for microphone permission. Older AVCaptureDevice/.audio and
+    // AVAudioSession.requestRecordPermission both still work but are
+    // either deprecated (iOS) or not applicable (macOS has no
+    // AVAudioSession). One API for both platforms keeps the call sites
+    // simple.
+    public static var permission: AppState.MicAuth {
+        switch AVAudioApplication.shared.recordPermission {
+        case .granted:      return .granted
+        case .denied:       return .denied
+        case .undetermined: return .notDetermined
+        @unknown default:   return .unknown
+        }
     }
 
-    static func requestPermission() async -> Bool {
-        await withCheckedContinuation { c in
-            AVCaptureDevice.requestAccess(for: .audio) { granted in
-                c.resume(returning: granted)
-            }
-        }
+    @discardableResult
+    public static func requestPermission() async -> Bool {
+        await AVAudioApplication.requestRecordPermission()
     }
 
     // MARK: engine lifecycle
 
-    func start() throws {
+    public func start() throws {
         guard !running else { return }
+
+        #if os(iOS)
+        try configureAudioSession()
+        #endif
+
         // Fresh engine every time — see the comment on `engine` for
         // why this matters (post-grant input-node rebinding).
         let engine = AVAudioEngine()
@@ -109,7 +142,7 @@ final class MicCaptureController {
               inFormat.sampleRate, Int(inFormat.channelCount))
     }
 
-    func stop() {
+    public func stop() {
         guard running else { return }
         if let engine {
             engine.inputNode.removeTap(onBus: 0)
@@ -118,8 +151,51 @@ final class MicCaptureController {
         engine = nil
         converter = nil
         running = false
+        #if os(iOS)
+        // Hand the audio system back to whoever was using it before
+        // (e.g. background music). If we leave the session active, the
+        // ducking from .record category persists.
+        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+        #endif
         NSLog("[mic] engine stopped")
     }
+
+    // MARK: iOS audio session
+
+    #if os(iOS)
+    private func configureAudioSession() throws {
+        let session = AVAudioSession.sharedInstance()
+
+        // Option compatibility with category .record (recording-only):
+        //   • .allowBluetoothHFP — Bluetooth Hands-Free Profile, the
+        //     input side of BT audio. Required for AirPods mic.
+        //     (Renamed from .allowBluetooth in iOS 17. We target iOS
+        //     26, so we use the new name unconditionally.)
+        //   • .bluetoothHighQualityRecording — iOS 26+. Promotes the
+        //     BT input from the legacy 8 kHz HFP profile to the new
+        //     high-rate one when AirPods etc. negotiate it.
+        //   • .allowBluetoothA2DP — *output* profile, INVALID with a
+        //     record-only category. Including it here returns
+        //     OSStatus -50 (paramErr) on real devices.
+        //   • .defaultToSpeaker — playback-only option, also invalid.
+        var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP]
+        if #available(iOS 26.0, *) {
+            options.insert(.bluetoothHighQualityRecording)
+        }
+
+        do {
+            // .measurement disables system AGC / voice processing.
+            // Doubao does its own NS / AGC server-side; double-
+            // processing makes the audio mushy. .voiceChat would be
+            // wrong here — that's tuned for symmetric two-way comms.
+            try session.setCategory(.record, mode: .measurement, options: options)
+            try session.setActive(true, options: [.notifyOthersOnDeactivation])
+            NSLog("[mic] AVAudioSession configured: .record/.measurement")
+        } catch {
+            throw MicError.sessionFailed(error.localizedDescription)
+        }
+    }
+    #endif
 
     // MARK: conversion (audio thread)
     //

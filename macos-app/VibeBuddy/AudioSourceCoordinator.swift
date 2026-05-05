@@ -226,13 +226,11 @@ final class AudioSourceCoordinator: ObservableObject {
 
     // MARK: helpers
 
+    // The shared MicCaptureController.permission already maps to
+    // AppState.MicAuth — this used to translate from AVAuthorizationStatus
+    // back when macOS used AVCaptureDevice directly. Kept as a one-liner
+    // wrapper so call sites read symmetrically with InputMonitoringPermission.check().
     private static func readMicAuth() -> AppState.MicAuth {
-        switch MicCaptureController.permission {
-        case .authorized:    return .granted
-        case .denied:        return .denied
-        case .restricted:    return .denied
-        case .notDetermined: return .notDetermined
-        @unknown default:    return .unknown
-        }
+        MicCaptureController.permission
     }
 }

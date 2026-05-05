@@ -5,9 +5,10 @@ import VibeBuddyCore
 
 // HotKeyPTTTrigger replaces the M5Stack hardware button when running in
 // mic mode. It listens for press/release of a configurable key via a
-// CGEventTap and emits the same PTTEvent vocabulary the BLE path uses,
-// including the 350 ms short-press → cancel rule that mirrors the
-// firmware's click-vs-hold discrimination.
+// CGEventTap and forwards the down/up edges to a shared PTTSession,
+// which handles the 350 ms short-press → cancel rule, watchdog, and
+// PTTEvent emission. Same logic as ButtonPTTTrigger on iOS — the
+// platform-specific work here is purely "how do I observe the key".
 //
 // Default binding: Right Option (kVK_RightOption = 0x3D). It's a
 // modifier so it doesn't double as a printable key, single-handed
@@ -30,26 +31,18 @@ final class HotKeyPTTTrigger: PTTTrigger {
     static let rightOptionKeyCode: Int64 = 0x3D
     var keyCode: Int64 = HotKeyPTTTrigger.rightOptionKeyCode
 
-    // Held shorter than this is treated as a click → cancel session.
-    // Matches the firmware's 350 ms threshold so muscle memory is
-    // identical between hardware-button and hotkey modes.
-    var shortPressMs: Int = 350
-
-    // Hard cap on a single hold. If a keyUp gets eaten (Mission Control,
-    // app focus loss, screen lock) we'd otherwise stream forever.
-    var maxHoldSec: TimeInterval = 30
-
     // MARK: PTTTrigger conformance
 
-    var onEvent: ((PTTEvent) -> Void)?
+    var onEvent: ((PTTEvent) -> Void)? {
+        get { session.onEvent }
+        set { session.onEvent = newValue }
+    }
 
     // MARK: state
 
+    private let session = PTTSession()
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
-    private var pressed = false
-    private var pressedAt: Date?
-    private var watchdog: DispatchSourceTimer?
     private(set) var enabled = false
 
     // MARK: PTTTrigger lifecycle
@@ -92,14 +85,9 @@ final class HotKeyPTTTrigger: PTTTrigger {
     }
 
     func disable() {
-        if pressed {
-            // Outstanding press — bail the session cleanly so we don't
-            // leave AudioStreamer / STT in active state forever.
-            onEvent?(.cancel)
-            pressed = false
-            pressedAt = nil
-        }
-        cancelWatchdog()
+        // Bails any in-flight session cleanly — equivalent to a cancel
+        // edge so AudioStreamer / STT don't stay armed.
+        session.reset()
         if let tap {
             CGEvent.tapEnable(tap: tap, enable: false)
             CFMachPortInvalidate(tap)
@@ -113,7 +101,7 @@ final class HotKeyPTTTrigger: PTTTrigger {
         NSLog("[ptt] hotkey disabled")
     }
 
-    // MARK: tap callback (kernel/CFRunLoop thread, but main run loop here)
+    // MARK: tap callback (CFRunLoop thread, dispatched to main)
 
     private static let tapCallback: CGEventTapCallBack = { _, type, event, refcon in
         guard let refcon else { return Unmanaged.passUnretained(event) }
@@ -133,7 +121,13 @@ final class HotKeyPTTTrigger: PTTTrigger {
             // that triggered the flag change.
             let down = event.flags.contains(.maskAlternate)
             if kc == me.keyCode {
-                Task { @MainActor in me.handleEdge(down: down) }
+                Task { @MainActor in
+                    if down {
+                        me.session.down()
+                    } else {
+                        me.session.up()
+                    }
+                }
             }
         }
         // listenOnly mode: we don't consume the event; the OS still
@@ -142,58 +136,10 @@ final class HotKeyPTTTrigger: PTTTrigger {
         return Unmanaged.passUnretained(event)
     }
 
-    // MARK: edge handling (main actor)
-
     private func reenable() {
         if let tap {
             CGEvent.tapEnable(tap: tap, enable: true)
             NSLog("[ptt] tap re-enabled after timeout")
         }
-    }
-
-    private func handleEdge(down: Bool) {
-        if down {
-            // Defensive against repeats — flagsChanged shouldn't repeat
-            // on hold the way keyDown does, but we also re-enter here
-            // after .tapDisabledByTimeout if the modifier is still held.
-            guard !pressed else { return }
-            pressed = true
-            pressedAt = Date()
-            onEvent?(.start(sampleRate: 16000))
-            scheduleWatchdog()
-        } else {
-            guard pressed, let t0 = pressedAt else { return }
-            pressed = false
-            pressedAt = nil
-            cancelWatchdog()
-            let heldMs = Int(Date().timeIntervalSince(t0) * 1000)
-            if heldMs < shortPressMs {
-                NSLog("[ptt] short press (%dms) → cancel", heldMs)
-                onEvent?(.cancel)
-            } else {
-                NSLog("[ptt] release (%dms) → stop", heldMs)
-                onEvent?(.stop)
-            }
-        }
-    }
-
-    private func scheduleWatchdog() {
-        cancelWatchdog()
-        let t = DispatchSource.makeTimerSource(queue: .main)
-        t.schedule(deadline: .now() + maxHoldSec)
-        t.setEventHandler { [weak self] in
-            guard let self, self.pressed else { return }
-            NSLog("[ptt] watchdog (%.0fs) — forcing stop", self.maxHoldSec)
-            self.pressed = false
-            self.pressedAt = nil
-            self.onEvent?(.stop)
-        }
-        t.resume()
-        watchdog = t
-    }
-
-    private func cancelWatchdog() {
-        watchdog?.cancel()
-        watchdog = nil
     }
 }
