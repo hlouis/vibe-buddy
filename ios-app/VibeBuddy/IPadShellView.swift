@@ -19,29 +19,81 @@ struct IPadShellView: View {
     enum SidebarTab: Hashable { case transcript, settings }
 
     @EnvironmentObject var router: TextRouter
+    @EnvironmentObject var state: AppState
     @State private var sidebarTab: SidebarTab = .transcript
     @State private var splitVisibility: NavigationSplitViewVisibility = .doubleColumn
     @AppStorage("statusBarExpanded") private var statusExpanded: Bool = true
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $splitVisibility) {
-            sidebarColumn
-                .navigationSplitViewColumnWidth(min: 260, ideal: 320, max: 380)
-        } detail: {
-            // NavigationStack here so BrowserTabView(.toolbarOnly) can
-            // hang its address bar off `.toolbar` — the navigation bar
-            // that the system already draws above the detail (with the
-            // sidebar-toggle button) becomes our address row, and we
-            // don't draw a second strip below it.
-            NavigationStack {
-                BrowserTabView(chrome: .toolbarOnly)
-                    .navigationBarTitleDisplayMode(.inline)
+        ZStack(alignment: .bottomTrailing) {
+            NavigationSplitView(columnVisibility: $splitVisibility) {
+                sidebarColumn
+                    .navigationSplitViewColumnWidth(min: 260, ideal: 320, max: 380)
+            } detail: {
+                // NavigationStack here so BrowserTabView(.toolbarOnly) can
+                // hang its address bar off `.toolbar` — the navigation bar
+                // that the system already draws above the detail (with the
+                // sidebar-toggle button) becomes our address row, and we
+                // don't draw a second strip below it.
+                NavigationStack {
+                    BrowserTabView(chrome: .toolbarOnly)
+                        .navigationBarTitleDisplayMode(.inline)
+                }
+            }
+            .navigationSplitViewStyle(.balanced)
+            // Browser is always present in detail → injection mode is the
+            // only mode that makes sense. Pin it on appear and never flip.
+            .onAppear { router.mode = .webview }
+            .onChange(of: splitVisibility) { _, vis in
+                // Bridge SwiftUI's tri-state visibility into AppState so
+                // the floating orb (which doesn't know about
+                // NavigationSplitView) can simply read sidebarVisible.
+                state.sidebarVisible = (vis != .detailOnly)
+            }
+            .onAppear {
+                state.sidebarVisible = (splitVisibility != .detailOnly)
+            }
+
+            // Top toasts: only visible when the sidebar is collapsed
+            // (the inline transcript card is hidden, so we mirror it
+            // up here). Same visibility logic as the orb.
+            if shouldShowOverlays {
+                VStack(spacing: 4) {
+                    ErrorBanner()
+                    TranscriptBanner()
+                    Spacer()
+                }
+            }
+
+            // Floating PTT orb — only visible when the sidebar is
+            // collapsed (= big in-sidebar mic button is hidden) and
+            // we're in mic mode with permission granted. iPad has no
+            // TabBar, so the orb sits closer to the bottom edge than
+            // it does on iPhone.
+            if shouldShowOrb {
+                FloatingPTTOrb(bottomInset: 24)
+                    .transition(.scale.combined(with: .opacity))
             }
         }
-        .navigationSplitViewStyle(.balanced)
-        // Browser is always present in detail → injection mode is the
-        // only mode that makes sense. Pin it on appear and never flip.
-        .onAppear { router.mode = .webview }
+        .animation(.spring(response: 0.32, dampingFraction: 0.78),
+                   value: shouldShowOrb)
+    }
+
+    private var shouldShowOrb: Bool {
+        guard state.audioSource == .mic else { return false }
+        guard state.micAuth == .granted else { return false }
+        guard state.hotkeyEnabled else { return false }
+        // Sidebar visible → big mic button in TranscriptTabView's
+        // sidebar slot is reachable; no orb needed. Collapsed → orb.
+        return splitVisibility == .detailOnly
+    }
+
+    // Overlay toasts (transcript live preview + error banner) appear
+    // whenever the inline transcript card isn't visible — i.e. the
+    // sidebar is collapsed. Looser rule than the orb: these are
+    // useful in BLE mode too.
+    private var shouldShowOverlays: Bool {
+        splitVisibility == .detailOnly
     }
 
     // MARK: sidebar

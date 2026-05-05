@@ -95,5 +95,12 @@ public final class AppState: ObservableObject {
     @Published public var focusEditable: Bool = true
     @Published public var focusDescription: String = ""
 
+    // iPad-only: tracks whether the NavigationSplitView's sidebar is
+    // visible. Used by the floating PTT orb to decide whether to show
+    // itself — the orb only appears when the in-sidebar mic button is
+    // hidden (sidebar collapsed). iPhone never reads this; macOS leaves
+    // it at the default.
+    @Published public var sidebarVisible: Bool = true
+
     public init() {}
 }
