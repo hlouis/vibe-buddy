@@ -1,0 +1,102 @@
+# ESP-IDF configuration, reachable only because platformio.ini builds
+# Arduino as an IDF component (`framework = arduino, espidf`) rather than
+# using the precompiled Arduino core.
+#
+# WHY THIS FILE EXISTS
+#
+# The precompiled arduino-esp32 core ships with power management compiled
+# OUT. Its sdkconfig has, verbatim:
+#
+#   # CONFIG_PM_ENABLE is not set
+#   # CONFIG_BT_CTRL_MODEM_SLEEP is not set
+#
+# So esp_pm_configure() is not merely unused, it does not exist: both CPU
+# cores spin at their full clock forever and the BLE radio never powers
+# down between connection events. The device is warm sitting idle with the
+# screen off, and no amount of tuning connection intervals or dropping to
+# 80 MHz changes it — a radio that never sleeps doesn't care how many
+# connection events it skips.
+#
+# Everything below that isn't PM is here to reproduce what the precompiled
+# core gave us for free.
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# --- device identity: DO NOT CHANGE -----------------------------------
+# Our advertised name is VibeBuddy-XXXX where XXXX is the last two bytes
+# of the BT MAC, and the host's pairing whitelist stores exactly that.
+#
+# The BT MAC is derived from the base MAC by an offset that depends on how
+# many universal MACs are allocated: with TWO it is base+1, with FOUR the
+# WiFi-AP address takes that slot and BT becomes base+2. ESP-IDF defaults
+# to FOUR; the prebuilt Arduino core used TWO.
+#
+# Leaving this at the IDF default silently renamed the device from
+# VibeBuddy-67AD to VibeBuddy-67AE on the very first boot after the
+# migration — which would have invalidated every already-paired install's
+# whitelist and left the app unable to connect, for a build-system change
+# that has nothing to do with identity.
+CONFIG_ESP32S3_UNIVERSAL_MAC_ADDRESSES_TWO=y
+CONFIG_ESP32S3_UNIVERSAL_MAC_ADDRESSES=2
+
+# --- flash / partitions -----------------------------------------------
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# --- console ----------------------------------------------------------
+# StickS3 has no UART bridge; the S3's native USB is the only console,
+# which is what ARDUINO_USB_CDC_ON_BOOT=1 in platformio.ini expects.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# --- Bluetooth --------------------------------------------------------
+# Bluedroid, not NimBLE: we use Arduino's BLEDevice.h, which is a
+# Bluedroid wrapper. (voicestick is NimBLE — do not copy their BT block.)
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_CLASSIC_ENABLED=n
+
+# The S3 speaks BLE 5.0, and ESP-IDF defaults to the 5.0 API set with the
+# 4.2 legacy one compiled out. Arduino's BLEDevice.h is written against
+# 4.2 (esp_ble_gap_config_adv_data, esp_ble_gap_start_advertising), so
+# without this the link dies on undefined references to exactly those.
+# The prebuilt core ships both enabled — this line restores that.
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=y
+
+# --- the entire point of the migration --------------------------------
+# PM_ENABLE gives us esp_pm_configure(); tickless idle is what actually
+# stops the clock when no task is runnable. IDLE_TIME_BEFORE_SLEEP=3 (at
+# HZ=1000, i.e. 3 ms) matches what voicestick runs on this same board.
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=3
+CONFIG_FREERTOS_HZ=1000
+
+# Lets the BT controller power its RF down between connection events.
+# MAIN_XTAL_PU keeps the main crystal up across light sleep so the
+# controller keeps its timing — the StickS3 has no external 32 kHz
+# crystal to fall back on. Same pairing voicestick uses here.
+CONFIG_BT_CTRL_MODEM_SLEEP=y
+CONFIG_BT_CTRL_MODEM_SLEEP_MODE_1=y
+CONFIG_BT_CTRL_MAIN_XTAL_PU_DURING_LIGHT_SLEEP=y
+
+# --- Arduino component ------------------------------------------------
+# Makes the Arduino component supply app_main(), which calls initArduino()
+# then our setup()/loop(). Without it the link fails with "undefined
+# reference to `app_main'": as a component, Arduino's main.cpp is opt-in,
+# whereas the prebuilt core always linked it.
+CONFIG_AUTOSTART_ARDUINO=y
+
+# Replaces SET_LOOP_TASK_STACK_SIZE(32 * 1024) from main.cpp: that macro
+# overrides a weak symbol in the precompiled core's main.cpp, which we no
+# longer link. libopus needs far more than the 8 KB default — see the
+# comment at the top of main.cpp for the crash it caused. Only has effect
+# with CONFIG_AUTOSTART_ARDUINO above.
+CONFIG_ARDUINO_LOOP_STACK_SIZE=32768
+
+# NOT setting CONFIG_SPIRAM. The only thing that ever wanted PSRAM was the
+# 32 KB audio ring, now in internal RAM. Octal PSRAM must stay clocked,
+# which would undercut the light sleep this whole file exists to enable —
+# the exact trap voicestick fell into by keeping SPIRAM_MODE_OCT on.

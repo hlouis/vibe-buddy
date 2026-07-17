@@ -1,5 +1,6 @@
 #include <M5Unified.h>
 #include <esp_mac.h>
+#include <esp_pm.h>
 #include <stdarg.h>
 #include "ble_bridge.h"
 #include "recorder.h"
@@ -13,9 +14,14 @@
 // then reboots. From the Mac's side that looked nothing like a crash —
 // the device stopped sending mid-session and the link only died 4 s
 // later on supervision timeout, so it read as "BLE went quiet".
-// 32 KB is generous; RAM is at ~17% and the alternative failure mode is
-// a reboot loop nobody can diagnose from the host side.
-SET_LOOP_TASK_STACK_SIZE(32 * 1024);
+//
+// The stack is now set via CONFIG_ARDUINO_LOOP_STACK_SIZE in
+// sdkconfig.defaults, NOT SET_LOOP_TASK_STACK_SIZE. That macro works by
+// overriding a weak symbol in the precompiled core's main.cpp, and since
+// the espidf-component build compiles the Arduino core from source with
+// its own Kconfig, the macro is a no-op there. Same 32 KB, different
+// lever — if you ever go back to `framework = arduino`, this has to come
+// back or the crash returns.
 
 static char deviceName[20] = "VibeBuddy";
 static bool btnAHeld = false;
@@ -118,32 +124,91 @@ static void updateBrightness() {
   applyBrightness(target);
 }
 
-// CPU frequency management. ESP32-S3 idle current scales roughly with
-// the active clock, and at 240 MHz the chip dissipates noticeably more
-// than at 80 MHz even when loop() is mostly delay()ing — the Idle task
-// doesn't enter light sleep without esp_pm_configure(), so the clock
-// keeps running. Two speeds based on user engagement:
-//   - recording OR screen at full brightness → 240 MHz (responsive)
-//   - everything else → 80 MHz (idle, dim, or off)
-// BLE controller runs on its own RF clock and tolerates either; I2S /
-// audio paths are only active when recording, which forces 240 anyway.
+// Power management. Driven by esp_pm locks rather than direct
+// setCpuFrequencyMhz() calls: with CONFIG_PM_ENABLE the PM layer owns the
+// clock, and a manual override just fights it.
+//
+// This only became possible by building Arduino as an ESP-IDF component.
+// The precompiled core has CONFIG_PM_ENABLE compiled out entirely, so
+// both cores spun at full clock forever and the BLE radio never powered
+// down between connection events — the device was warm sitting idle with
+// the screen off, and no CPU-frequency or connection-interval tuning
+// could touch it. See sdkconfig.defaults.
+//
+// Three locks, each for a distinct reason:
+//
+//  • cpuLock (CPU_FREQ_MAX) — held while recording or while the screen is
+//    at full brightness. Recording needs it because Opus encoding eats a
+//    third of realtime at 240 MHz and would blow the 60 ms frame budget
+//    at 80 (see MAX_ENCODES_PER_TICK in recorder.cpp).
+//
+//  • recSleepLock (NO_LIGHT_SLEEP) — held while recording. CPU_FREQ_MAX
+//    pins the clock but does NOT prevent sleep, and sleeping mid-session
+//    would cut I2S DMA. Sessions are seconds long, so this costs nothing.
+//
+//  • usbSleepLock (NO_LIGHT_SLEEP) — held while VBUS is present. Light
+//    sleep drops the USB Serial JTAG console, which would silently break
+//    `make fw-capture` and every serial-based debug workflow. On USB
+//    there is no battery to protect anyway — the same reasoning that
+//    already pins the backlight on in updateBrightness(). Sleep is for
+//    battery, which is the only case that ever needed it.
 static constexpr uint32_t CPU_HIGH_MHZ = 240;
 static constexpr uint32_t CPU_LOW_MHZ  = 80;
-static uint32_t currentCpuMhz = CPU_HIGH_MHZ;
 
-static void applyCpuFreq(uint32_t mhz) {
-  if (mhz == currentCpuMhz) return;
-  setCpuFrequencyMhz(mhz);
-  currentCpuMhz = mhz;
-  // setCpuFrequencyMhz reconfigures UART dividers internally; no need
-  // to re-init Serial. A handful of in-flight bytes may garble.
-  Serial.printf("[cpu] -> %u MHz\n", (unsigned)mhz);
+static esp_pm_lock_handle_t cpuLock = nullptr;
+static esp_pm_lock_handle_t recSleepLock = nullptr;
+static esp_pm_lock_handle_t usbSleepLock = nullptr;
+static bool cpuLockHeld = false;
+static bool recSleepHeld = false;
+static bool usbSleepHeld = false;
+
+static void holdLock(esp_pm_lock_handle_t h, bool& held, bool want, const char* tag) {
+  if (!h || want == held) return;
+  if (want) esp_pm_lock_acquire(h); else esp_pm_lock_release(h);
+  held = want;
+  Serial.printf("[pm] %s %s\n", tag, want ? "acquire" : "release");
+}
+
+static void initPowerManagement() {
+  // Seed g_usbPowered BEFORE light sleep can ever happen. It is otherwise
+  // only refreshed by the 10 s battery poll, and its initial false meant
+  // usbSleepLock stayed unheld for the first ten seconds of every boot —
+  // long enough for the system to idle, light-sleep, and take the USB
+  // Serial JTAG console down with it. The device ran fine (BLE connected,
+  // heartbeats flowing); the serial log just stopped dead at phy_init and
+  // looked exactly like a hang. Read VBUS here so the lock is right from
+  // the first opportunity to sleep.
+  int16_t vbus = M5.Power.getVBUSVoltage();
+  g_usbPowered = (vbus < 0) ? M5.Power.isCharging() : (vbus > 4000);
+  Serial.printf("[pm] boot vbus=%d usb=%d\n", (int)vbus, g_usbPowered ? 1 : 0);
+
+  // esp_pm_config_esp32s3_t, not esp_pm_config_t: this platform pins
+  // ESP-IDF 4.4.7, where the struct is still per-target. It was renamed
+  // in IDF 5.x, so this line moves if the platform is ever bumped.
+  esp_pm_config_esp32s3_t pm = {};
+  pm.max_freq_mhz = CPU_HIGH_MHZ;
+  pm.min_freq_mhz = CPU_LOW_MHZ;
+  pm.light_sleep_enable = true;
+  esp_err_t e = esp_pm_configure(&pm);
+  Serial.printf("[pm] configure %u/%u MHz light_sleep=1 -> %s\n",
+                (unsigned)CPU_HIGH_MHZ, (unsigned)CPU_LOW_MHZ, esp_err_to_name(e));
+
+  esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX,   0, "cpu", &cpuLock);
+  esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "rec", &recSleepLock);
+  esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "usb", &usbSleepLock);
+
+  // Take the USB lock here, not on the first updateCpuFreq() in loop():
+  // the window between esp_pm_configure() and the first loop pass is
+  // itself long enough (BLE init, radio calibration) for the system to
+  // idle and sleep, which is where the console was being lost.
+  holdLock(usbSleepLock, usbSleepHeld, g_usbPowered, "usb-nosleep");
 }
 
 static void updateCpuFreq() {
-  uint32_t target = (recorderActive() || currentBrightness == BRIGHT_FULL)
-                    ? CPU_HIGH_MHZ : CPU_LOW_MHZ;
-  applyCpuFreq(target);
+  bool busy = recorderActive() || currentBrightness == BRIGHT_FULL;
+  holdLock(cpuLock,      cpuLockHeld,  busy,             "cpu");
+  holdLock(recSleepLock, recSleepHeld, recorderActive(), "rec-nosleep");
+  holdLock(usbSleepLock, usbSleepHeld, g_usbPowered,     "usb-nosleep");
 }
 
 // Power profiling tick — 1 s cadence. AXP2101 on StickS3 does not expose
@@ -490,6 +555,7 @@ void setup() {
 
   buildDeviceName();
   Serial.printf("[boot] device name: %s\n", deviceName);
+  initPowerManagement();
   bleInit(deviceName);
   recorderInit();
 
@@ -592,14 +658,14 @@ void loop() {
                   recorderActive() ? 1 : 0,
                   btnAHeld ? 1 : 0,
                   (unsigned)currentBrightness,
-                  (unsigned)currentCpuMhz);
+                  (unsigned)getCpuFrequencyMhz());
     bleLogf("mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u cpu=%u",
             g_mv, g_mvPerMin,
             bleConnected() ? 1 : 0,
             recorderActive() ? 1 : 0,
             btnAHeld ? 1 : 0,
             (unsigned)currentBrightness,
-            (unsigned)currentCpuMhz);
+            (unsigned)getCpuFrequencyMhz());
   }
 
   if (lastBatteryPoll == 0 || now - lastBatteryPoll >= BATTERY_POLL_MS) {
