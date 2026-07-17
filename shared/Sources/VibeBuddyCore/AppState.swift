@@ -27,6 +27,20 @@ public final class AppState: ObservableObject {
         }
     }
 
+    // A Vibe Buddy seen during a pairing scan. `id` is the XXXX suffix
+    // the user can read off the device screen; rssi refreshes as long as
+    // the pairing sheet is open (we scan with allowDuplicates there).
+    public struct DiscoveredDevice: Identifiable, Equatable {
+        public let id: String       // "C3D8"
+        public let name: String     // "VibeBuddy-C3D8"
+        public var rssi: Int
+        public init(id: String, name: String, rssi: Int) {
+            self.id = id
+            self.name = name
+            self.rssi = rssi
+        }
+    }
+
     public struct AudioSession: Equatable {
         public var active: Bool
         public var bytes: Int
@@ -78,6 +92,14 @@ public final class AppState: ObservableObject {
     @Published public var totalSessions: Int = 0
     @Published public var bluetoothPoweredOn: Bool = false
     @Published public var lastDumpPath: String? = nil
+
+    // Device pairing. An empty pairedDeviceIDs means "unpaired" and we
+    // fall back to connecting to whatever Vibe Buddy shows up first —
+    // the behavior every existing install has today. Once the list is
+    // non-empty it is authoritative and unlisted devices are ignored.
+    @Published public var pairedDeviceIDs: [String] = []
+    @Published public var discoveredDevices: [DiscoveredDevice] = []
+    @Published public var discovering: Bool = false
 
     // ASR / injection state
     @Published public var sttStatus: String = "idle"

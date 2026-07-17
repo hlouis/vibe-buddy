@@ -36,14 +36,100 @@ public final class BLEController: NSObject, ObservableObject {
     private var txCharacteristic: CBCharacteristic?
     private var jsonBuffer = Data()
 
+    // Authoritative copy; AppState.pairedDeviceIDs mirrors it for the UI.
+    // Empty = unpaired = connect to the first Vibe Buddy we see.
+    private var pairedDeviceIDs: [String] = []
+
+    // True while a pairing sheet is open. Changes two things: we scan
+    // with allowDuplicates (so RSSI keeps refreshing) and we don't
+    // stopScan() on connect.
+    private var discovering = false
+
     public init(textHandler: any TextHandler) {
         self.audio = AudioStreamer(textHandler: textHandler)
+        self.pairedDeviceIDs = PairedDeviceStore.load()
         super.init()
         central = CBCentralManager(delegate: self, queue: .main)
+        NSLog("[ble] paired devices: %@",
+              pairedDeviceIDs.isEmpty ? "(none — will connect to first seen)"
+                                      : pairedDeviceIDs.joined(separator: ","))
+    }
+
+    // MARK: pairing
+
+    // "VibeBuddy-C3D8" -> "C3D8". nil for anything not ours.
+    nonisolated public static func deviceID(fromName name: String) -> String? {
+        guard name.hasPrefix(namePrefix) else { return nil }
+        let id = String(name.dropFirst(namePrefix.count))
+        return id.isEmpty ? nil : id.uppercased()
+    }
+
+    private func shouldConnect(to name: String) -> Bool {
+        guard let id = Self.deviceID(fromName: name) else { return false }
+        // Unpaired: preserve the legacy first-seen behavior so existing
+        // installs keep working after an upgrade.
+        guard !pairedDeviceIDs.isEmpty else { return true }
+        return pairedDeviceIDs.contains(id)
+    }
+
+    // Called by the pairing UI when its sheet appears.
+    public func startDiscovery() {
+        discovering = true
+        state?.discovering = true
+        state?.discoveredDevices = []
+        guard central.state == .poweredOn else { return }
+        // allowDuplicates so RSSI updates while the sheet is open. This
+        // is more expensive than a plain scan, which is exactly why it's
+        // scoped to the sheet's lifetime rather than always-on.
+        central.scanForPeripherals(
+            withServices: [Self.nusService],
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+        )
+        NSLog("[ble] discovery scan started")
+    }
+
+    public func stopDiscovery() {
+        discovering = false
+        state?.discovering = false
+        guard central.state == .poweredOn else { return }
+        central.stopScan()
+        // If the sheet's pairing changes stranded us on a device that's
+        // no longer paired, drop it; otherwise resume the normal scan
+        // only when we have nothing connected.
+        if let p = peripheral, let name = p.name, !shouldConnect(to: name) {
+            NSLog("[ble] %@ no longer paired — disconnecting", name)
+            central.cancelPeripheralConnection(p)   // triggers beginScan via delegate
+        } else if peripheral == nil {
+            beginScan()
+        }
+        NSLog("[ble] discovery scan stopped")
+    }
+
+    public func pair(deviceID id: String) {
+        var ids = pairedDeviceIDs
+        ids.append(id)
+        applyPairing(PairedDeviceStore.normalize(ids))
+    }
+
+    public func unpair(deviceID id: String) {
+        let target = id.uppercased()
+        applyPairing(pairedDeviceIDs.filter { $0 != target })
+    }
+
+    private func applyPairing(_ ids: [String]) {
+        pairedDeviceIDs = ids
+        PairedDeviceStore.save(ids)
+        state?.pairedDeviceIDs = ids
+        NSLog("[ble] paired devices now: %@",
+              ids.isEmpty ? "(none)" : ids.joined(separator: ","))
+        // Don't tear down a live link here — stopDiscovery() reconciles
+        // once the user is done editing. Unpairing the connected device
+        // mid-sheet and re-pairing it shouldn't cost a reconnect.
     }
 
     public func bind(state: AppState) {
         self.state = state
+        state.pairedDeviceIDs = pairedDeviceIDs
         audio.onSessionUpdate = { [weak state] update in
             state?.session = update
         }
@@ -94,8 +180,16 @@ public final class BLEController: NSObject, ObservableObject {
         state?.linkParams = AppState.LinkParams()
         // Filter by service UUID at scan time so we only see actual Vibe
         // Buddy advertisements (not every BLE thing on the street).
-        central.scanForPeripherals(withServices: [Self.nusService], options: nil)
-        NSLog("[ble] scanning for services=%@", Self.nusService.uuidString)
+        //
+        // Keep allowDuplicates on if a pairing sheet is open: a
+        // disconnect re-enters here, and a plain rescan would silently
+        // replace the discovery scan and freeze the sheet's RSSI values.
+        let options: [String: Any]? = discovering
+            ? [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+            : nil
+        central.scanForPeripherals(withServices: [Self.nusService], options: options)
+        NSLog("[ble] scanning for services=%@%@", Self.nusService.uuidString,
+              discovering ? " (+duplicates, pairing sheet open)" : "")
     }
 }
 
@@ -116,15 +210,43 @@ extension BLEController: CBCentralManagerDelegate {
                         didDiscover peripheral: CBPeripheral,
                         advertisementData: [String : Any],
                         rssi RSSI: NSNumber) {
-        guard let name = peripheral.name, name.hasPrefix(Self.namePrefix) else { return }
+        guard let name = peripheral.name, let id = Self.deviceID(fromName: name) else { return }
         Task { @MainActor in
-            NSLog("[ble] discovered %@ rssi=%d", name, RSSI.intValue)
-            central.stopScan()
+            // Feed the pairing sheet regardless of whether this device
+            // is paired — the whole point of that list is to show the
+            // ones you haven't paired yet.
+            if self.discovering {
+                self.upsertDiscovered(id: id, name: name, rssi: RSSI.intValue)
+            }
+
+            // Connect path. Only one link at a time: if we already have
+            // a peripheral (connecting or connected) leave it alone.
+            guard self.peripheral == nil else { return }
+            guard self.shouldConnect(to: name) else { return }
+
+            NSLog("[ble] connecting to %@ rssi=%d", name, RSSI.intValue)
+            // Keep the radio scanning while a pairing sheet is up, so
+            // its list doesn't freeze the moment we latch onto a device.
+            if !self.discovering { central.stopScan() }
             self.peripheral = peripheral
             peripheral.delegate = self
             self.state?.link = .connecting(name)
             central.connect(peripheral, options: nil)
         }
+    }
+
+    @MainActor
+    private func upsertDiscovered(id: String, name: String, rssi: Int) {
+        guard let state else { return }
+        if let i = state.discoveredDevices.firstIndex(where: { $0.id == id }) {
+            state.discoveredDevices[i].rssi = rssi
+        } else {
+            state.discoveredDevices.append(
+                AppState.DiscoveredDevice(id: id, name: name, rssi: rssi)
+            )
+        }
+        // Strongest first — the one in your hand should be at the top.
+        state.discoveredDevices.sort { $0.rssi > $1.rssi }
     }
 
     nonisolated public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {

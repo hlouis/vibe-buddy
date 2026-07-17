@@ -12,14 +12,92 @@ import VibeBuddyCore
 // window because the user reaches for those mid-task, not Cmd+,.
 struct SettingsView: View {
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var ble: BLEController
 
     var body: some View {
         TabView {
             DoubaoSettings()
                 .environmentObject(state)
                 .tabItem { Label("Doubao API", systemImage: "key") }
+            DeviceSettings()
+                .environmentObject(state)
+                .environmentObject(ble)
+                .tabItem { Label("设备", systemImage: "dot.radiowaves.left.and.right") }
         }
         .frame(width: 520, height: 360)
+    }
+}
+
+// Device pairing. Scanning here is deliberately tied to the tab being
+// visible (onAppear/onDisappear): it runs with allowDuplicates so RSSI
+// stays live, which is too expensive to leave on permanently.
+private struct DeviceSettings: View {
+    @EnvironmentObject var state: AppState
+    @EnvironmentObject var ble: BLEController
+
+    private var connectedID: String? {
+        guard case .connected(let name) = state.link else { return nil }
+        return BLEController.deviceID(fromName: name)
+    }
+
+    private var unpaired: [AppState.DiscoveredDevice] {
+        state.discoveredDevices.filter { !state.pairedDeviceIDs.contains($0.id) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if state.pairedDeviceIDs.isEmpty {
+                Label("未配对：将连接第一个搜索到的 VibeBuddy 设备。配对后只连白名单内的设备。",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text("已配对").font(.headline)
+            if state.pairedDeviceIDs.isEmpty {
+                Text("（无）").foregroundStyle(.secondary).font(.callout)
+            } else {
+                ForEach(state.pairedDeviceIDs, id: \.self) { id in
+                    HStack {
+                        Circle()
+                            .fill(connectedID == id ? Color.green : Color.secondary.opacity(0.4))
+                            .frame(width: 8, height: 8)
+                        Text("VibeBuddy-\(id)").font(.system(.body, design: .monospaced))
+                        if connectedID == id {
+                            Text("已连接").font(.caption).foregroundStyle(.green)
+                        }
+                        Spacer()
+                        Button("取消配对") { ble.unpair(deviceID: id) }
+                            .controlSize(.small)
+                    }
+                }
+            }
+
+            Divider()
+
+            HStack {
+                Text("附近设备").font(.headline)
+                if state.discovering { ProgressView().controlSize(.small) }
+            }
+            if unpaired.isEmpty {
+                Text(state.discovering ? "搜索中…" : "未搜索到未配对的设备")
+                    .foregroundStyle(.secondary).font(.callout)
+            } else {
+                ForEach(unpaired) { dev in
+                    HStack {
+                        Text(dev.name).font(.system(.body, design: .monospaced))
+                        Text("\(dev.rssi) dBm").font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("配对") { ble.pair(deviceID: dev.id) }
+                            .controlSize(.small)
+                    }
+                }
+            }
+            Spacer()
+        }
+        .padding(20)
+        .onAppear { ble.startDiscovery() }
+        .onDisappear { ble.stopDiscovery() }
     }
 }
 

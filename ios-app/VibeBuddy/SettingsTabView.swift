@@ -84,6 +84,25 @@ struct SettingsTabView: View {
 
                 Section {
                     NavigationLink {
+                        DevicePairingView()
+                    } label: {
+                        LabeledContent {
+                            Text(state.pairedDeviceIDs.isEmpty
+                                 ? "未配对"
+                                 : state.pairedDeviceIDs.joined(separator: ", "))
+                                .foregroundStyle(.secondary)
+                        } label: {
+                            Label("配对设备", systemImage: "dot.radiowaves.left.and.right")
+                        }
+                    }
+                } header: {
+                    Text("蓝牙设备")
+                } footer: {
+                    Text("未配对时会连接第一个搜索到的 VibeBuddy 设备；配对后只连白名单内的设备。")
+                }
+
+                Section {
+                    NavigationLink {
                         KeyPolicyListView()
                     } label: {
                         Label("按键策略", systemImage: "keyboard")

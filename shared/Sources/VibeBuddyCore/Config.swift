@@ -48,7 +48,9 @@ public struct Config {
     // MARK: macOS — XDG config file
 
     #if os(macOS)
-    public static func configURL() -> URL {
+    // Shared by config.json and PairedDeviceStore's devices.json so the
+    // XDG resolution lives in exactly one place.
+    public static func configDir() -> URL {
         let base: URL
         if let xdg = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"],
            !xdg.isEmpty {
@@ -57,7 +59,11 @@ public struct Config {
             base = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".config", isDirectory: true)
         }
-        return base.appendingPathComponent("vibe-buddy/config.json")
+        return base.appendingPathComponent("vibe-buddy", isDirectory: true)
+    }
+
+    public static func configURL() -> URL {
+        configDir().appendingPathComponent("config.json")
     }
 
     private static func loadFromXDG() -> Config? {

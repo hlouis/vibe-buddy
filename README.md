@@ -258,6 +258,7 @@ iOS 端关键标签：`[ble]` / `[stt]` / `[wv]`（WebView 注入）。模拟器
 
 - **BLE 服务**：复用 Nordic UART Service（NUS），UUID `6E400001-...`，与 [claude-desktop-buddy](https://github.com/imliubo/claude-desktop-buddy/tree/feat/migrate-to-m5unified) 协议兼容
 - **广播名**：`VibeBuddy-XXXX`（XXXX = BT MAC 后 4 位十六进制）
+- **设备配对**：应用层白名单，不是 BLE bonding（链路仍是明文，加密见 Phase 2）。白名单存 `XXXX` 后缀——它源自 BT MAC，跨主机稳定，跟机身屏幕上显示的一致。macOS 存 `~/.config/vibe-buddy/devices.json`，iOS 存 `UserDefaults`。**白名单为空 = 连第一个搜索到的设备**（保持老行为，升级不会断连）；非空则只连白名单内的。配对界面在 macOS `设置 → 设备` / iOS `设置 → 蓝牙设备`
 - **帧分派**：JSON 文本帧以 `\n` 结束；音频二进制帧以魔数 `0xFF 0xAA` 起头，后跟 `seq[2B LE]` + `len[2B LE]` + PCM
 - **链路协商**：连接建立后固件请求 2M PHY + MTU 517（notify payload 上限 500 B）+ DLE 251 + conn interval 7.5–15ms，结果通过 `{"type":"link","phy":"...","mtu":...}` 上报
 - **采样率**：固定 16 kHz，无降级档。2M PHY 是硬性前提——协商不到 2M 时 `recorderStart()` 直接拒绝录音而不是降级，让问题暴露而不是藏起来（见 `ble_bridge.h` 顶部注释）。仍通过 `{"type":"audio","event":"start","sample_rate":N}` 告知 Mac

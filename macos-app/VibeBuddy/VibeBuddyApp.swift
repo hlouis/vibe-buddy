@@ -69,11 +69,12 @@ struct VibeBuddyApp: App {
         .windowResizability(.contentSize)
 
         // Standard macOS Settings window (Cmd+,). Lets the user manage
-        // Doubao credentials without ever opening a terminal — see
-        // SettingsView for scope rationale.
+        // Doubao credentials and device pairing without ever opening a
+        // terminal — see SettingsView for scope rationale.
         Settings {
             SettingsView()
                 .environmentObject(state)
+                .environmentObject(ble)
         }
     }
 }
