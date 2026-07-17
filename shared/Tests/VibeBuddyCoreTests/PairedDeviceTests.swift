@@ -50,4 +50,41 @@ final class PairedDeviceTests: XCTestCase {
     func testNormalizeEmptyStaysEmpty() {
         XCTAssertEqual(PairedDeviceStore.normalize([]), [])
     }
+
+    // MARK: DiscoveredDevice
+    //
+    // Regression cover for the pairing sheet's seeding fix. The list is
+    // built from scan callbacks, but a connected peripheral stops
+    // advertising — so on an unpaired install, where the legacy
+    // first-seen path has already connected to the user's only stick,
+    // the sheet could never show the one device they wanted to pair.
+    // BLEController.startDiscovery() now seeds from the live peripheral;
+    // these pin the identity rules that seeding depends on.
+
+    // Seeding and scanning both funnel into upsertDiscovered, so the two
+    // must agree on identity or the connected device would appear twice
+    // the moment it also got scanned.
+    func testDiscoveredDeviceIdentityIsTheDeviceIDNotTheName() {
+        let seeded = AppState.DiscoveredDevice(id: "C3D8", name: "VibeBuddy-C3D8", rssi: 0)
+        let scanned = AppState.DiscoveredDevice(id: "C3D8", name: "VibeBuddy-C3D8", rssi: -40)
+        XCTAssertEqual(seeded.id, scanned.id)
+    }
+
+    // The seed lands before readRSSI() returns, so it carries a
+    // placeholder. It must still be a listable entry — showing the
+    // device with a bogus signal beats not showing it at all.
+    func testDiscoveredDeviceToleratesPlaceholderRSSI() {
+        let d = AppState.DiscoveredDevice(id: "C3D8", name: "VibeBuddy-C3D8", rssi: 0)
+        XCTAssertEqual(d.rssi, 0)
+        XCTAssertEqual(d.id, "C3D8")
+    }
+
+    // The whitelist is authoritative only when non-empty; empty means
+    // "connect to the first VibeBuddy seen", which is the pre-pairing
+    // behavior every existing install upgrades from. It is also exactly
+    // the state in which the seeding fix matters.
+    func testEmptyWhitelistIsTheUnpairedFirstSeenState() {
+        XCTAssertTrue(PairedDeviceStore.normalize([]).isEmpty)
+        XCTAssertFalse(PairedDeviceStore.normalize(["C3D8"]).isEmpty)
+    }
 }

@@ -45,6 +45,11 @@ public final class BLEController: NSObject, ObservableObject {
     // stopScan() on connect.
     private var discovering = false
 
+    // Last readRSSI() result for the connected peripheral. A connected
+    // device never advertises, so this is the only way to show a signal
+    // strength for it in the pairing list.
+    private var connectedRSSI: Int?
+
     public init(textHandler: any TextHandler) {
         self.audio = AudioStreamer(textHandler: textHandler)
         self.pairedDeviceIDs = PairedDeviceStore.load()
@@ -78,6 +83,20 @@ public final class BLEController: NSObject, ObservableObject {
         state?.discovering = true
         state?.discoveredDevices = []
         guard central.state == .poweredOn else { return }
+
+        // Seed the list with the device we're already talking to. A
+        // connected peripheral stops advertising, so a scan can never
+        // surface it — and on an unpaired install the legacy first-seen
+        // path has already connected to exactly the device the user
+        // opened this sheet to pair. Without this the list is
+        // permanently empty for the single-stick case and there is no
+        // way to pair the stick you're holding.
+        if let p = peripheral, let name = p.name,
+           let id = Self.deviceID(fromName: name) {
+            upsertDiscovered(id: id, name: name, rssi: connectedRSSI ?? 0)
+            p.readRSSI()   // refreshed via didReadRSSI while the sheet is open
+        }
+
         // allowDuplicates so RSSI updates while the sheet is open. This
         // is more expensive than a plain scan, which is exactly why it's
         // scoped to the sheet's lifetime rather than always-on.
@@ -173,6 +192,7 @@ public final class BLEController: NSObject, ObservableObject {
     private func beginScan() {
         guard central.state == .poweredOn else { return }
         peripheral = nil
+        connectedRSSI = nil
         rxCharacteristic = nil
         txCharacteristic = nil
         jsonBuffer.removeAll()
@@ -285,6 +305,26 @@ extension BLEController: CBCentralManagerDelegate {
 }
 
 extension BLEController: CBPeripheralDelegate {
+    // Only ever requested while a pairing sheet is open, to give the
+    // connected (and therefore non-advertising) device a live signal
+    // reading alongside the scanned ones. Re-arms itself so the value
+    // tracks as the user walks around.
+    nonisolated public func peripheral(_ peripheral: CBPeripheral,
+                                       didReadRSSI RSSI: NSNumber,
+                                       error: Error?) {
+        guard error == nil else { return }
+        Task { @MainActor in
+            self.connectedRSSI = RSSI.intValue
+            guard self.discovering, let name = peripheral.name,
+                  let id = Self.deviceID(fromName: name) else { return }
+            self.upsertDiscovered(id: id, name: name, rssi: RSSI.intValue)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if self.discovering, self.peripheral === peripheral {
+                peripheral.readRSSI()
+            }
+        }
+    }
+
     nonisolated public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard let svc = peripheral.services?.first(where: { $0.uuid == Self.nusService }) else { return }
         peripheral.discoverCharacteristics([Self.rxChar, Self.txChar], for: svc)
