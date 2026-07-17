@@ -29,6 +29,14 @@ static constexpr int OPUS_FRAME_SAMPLES = 960;
 static constexpr int OPUS_BITRATE = 20000;
 static constexpr size_t OPUS_MAX_PACKET = 256;
 
+// CBR over a fixed frame size makes the packet size deterministic:
+// 20000 bps * 60 ms / 8 = 150 B. OPUS_MAX_PACKET is the buffer's worst
+// case, but this is what actually goes out, and it's what the MTU has to
+// accommodate — gating on the 256 worst case instead would refuse to
+// record on a perfectly usable 247-byte MTU link.
+static constexpr size_t OPUS_CBR_PACKET =
+    (size_t)OPUS_BITRATE * (size_t)OPUS_FRAME_SAMPLES / (size_t)SAMPLE_RATE / 8;
+
 // Ceiling on frames encoded per recorderTick(). The drain condition is
 // "ring has >= one frame", and the mic task on core 1 refills it at one
 // frame per 60 ms — so if encoding were ever slower than realtime, an
@@ -157,8 +165,33 @@ static bool opusBringUp() {
 
 // Frame and ship one Opus packet. Returns false if the link pushed back,
 // in which case the caller must park the packet — it cannot be rebuilt.
+//
+// One frame MUST fit in one ATT notify. The host's dispatch() keys on the
+// 0xFF 0xAA magic being the first two bytes of a notify and treats one
+// notify as one whole frame; bleWrite happily fragments anything larger
+// than mtu-3, and the tail fragments carry no magic, so they'd be routed
+// into the JSON parser as garbage while the head is dropped as truncated.
+// The result is a session that looks fine on the device (REC on, frames
+// counting up) and yields zero transcript on the Mac.
+//
+// The PCM drain loop this replaced derived its payload size from
+// bleMtu() on every tick and so couldn't hit this; that guard was lost
+// with it. It matters because bleLinkReady() gates recording on 2M PHY
+// only — it never checks MTU — and the ATT MTU exchange is not ordered
+// against the PHY update, so a press can land while mtu is still 23.
 static bool sendOpusFrame(const uint8_t* pkt, size_t len) {
   static uint8_t frame[6 + OPUS_MAX_PACKET];
+  uint16_t mtu = bleMtu();
+  size_t notifyCap = mtu > 3 ? (size_t)(mtu - 3) : 20;
+  if (notifyCap > 500) notifyCap = 500;
+  if (6 + len > notifyCap) {
+    // Dropping the packet beats emitting a fragmented one: the host
+    // recovers from a seq gap, but not from garbage in its JSON buffer.
+    Serial.printf("[rec] frame %u B > notify cap %u B (mtu=%u) — dropped\n",
+                  (unsigned)(6 + len), (unsigned)notifyCap, (unsigned)mtu);
+    frameSeq++;   // keep the host's gap accounting honest
+    return true;  // not backpressure; don't park it for retry
+  }
   frame[0] = 0xFF;
   frame[1] = 0xAA;
   frame[2] = (uint8_t)(frameSeq & 0xFF);
@@ -234,13 +267,31 @@ static void recorderTask(void*) {
       Serial.printf("[mic] chunk=%u peak=%d\n", (unsigned)chunkCount, (int)peak);
     }
 
-    // Spill into ring. Overrun: drop oldest (advance tail) so recent
-    // speech survives.
+    // Spill into ring. On overrun we drop the NEWEST sample rather than
+    // advancing tail to drop the oldest, because this task runs on core
+    // 1 and recorderTick() drains on core 0: only the consumer may move
+    // ringTail. Both writing it made the ring a non-SPSC queue, and
+    // `volatile` buys visibility, not atomicity — the two
+    // read-modify-writes interleave. Lose the producer's `tail + 1` and
+    // ringHead catches up to ringTail, so ringAvail() reads 0 and a full
+    // ring looks empty: a whole second of audio silently gone. Lose the
+    // consumer's `tail + 960` and 959 already-encoded samples get
+    // re-encoded, desyncing the Ogg granule timeline.
+    //
+    // Only ever writing ringTail here and ringHead there makes plain
+    // volatile sufficient: each core reads the other's index and a stale
+    // read is always the conservative direction (producer sees less free
+    // space, consumer sees less data), never a corrupt one.
+    //
+    // Dropping newest instead of oldest is a real behavior change on a
+    // path that should never fire — the drain has >10x margin (see
+    // MAX_ENCODES_PER_TICK) — and `overruns` in the stop log is how
+    // you'd find out it did.
     for (size_t i = 0; i < CHUNK_SAMPLES; i++) {
       size_t next = (ringHead + 1) % RING_SAMPLES;
       if (next == ringTail) {
-        ringTail = (ringTail + 1) % RING_SAMPLES;
         overruns++;
+        continue;
       }
       ring[ringHead] = done[i];
       ringHead = next;
@@ -279,6 +330,25 @@ void recorderStart() {
   if (active) return;
   if (!bleLinkReady()) {
     Serial.println("[rec] refused start: BLE link not ready (need 2M PHY)");
+    return;
+  }
+  // bleLinkReady() only vouches for the PHY. The ATT MTU exchange is a
+  // separate handshake with no ordering guarantee against it, so it can
+  // still be at the 23-byte default here — under which every Opus frame
+  // would be fragmented across notifies and arrive as garbage. Refuse
+  // loudly rather than record a session the host can't parse; the same
+  // "surface it, don't hide it" call ble_bridge.h makes for the PHY.
+  //
+  // Gate on the CBR packet size, not OPUS_MAX_PACKET: the latter would
+  // put the bar at 265 and lock out a negotiated 247-byte MTU that
+  // carries our 150-byte frames without trouble. sendOpusFrame still
+  // range-checks each frame, so a freak oversized packet is dropped
+  // rather than fragmented.
+  const uint16_t minMtu = 6 + OPUS_CBR_PACKET + 3;
+  if (bleMtu() < minMtu) {
+    Serial.printf("[rec] refused start: MTU %u < %u needed for %u B frames\n",
+                  (unsigned)bleMtu(), (unsigned)minMtu,
+                  (unsigned)(6 + OPUS_CBR_PACKET));
     return;
   }
   // Cancel any pending teardown — we're about to need the codec.
