@@ -259,9 +259,9 @@ iOS 端关键标签：`[ble]` / `[stt]` / `[wv]`（WebView 注入）。模拟器
 - **BLE 服务**：复用 Nordic UART Service（NUS），UUID `6E400001-...`，与 [claude-desktop-buddy](https://github.com/imliubo/claude-desktop-buddy/tree/feat/migrate-to-m5unified) 协议兼容
 - **广播名**：`VibeBuddy-XXXX`（XXXX = BT MAC 后 4 位十六进制）
 - **帧分派**：JSON 文本帧以 `\n` 结束；音频二进制帧以魔数 `0xFF 0xAA` 起头，后跟 `seq[2B LE]` + `len[2B LE]` + PCM
-- **链路协商**：连接建立后固件请求 2M PHY + MTU 247 + DLE，结果通过 `{"type":"link","phy":"...","mtu":...}` 上报
-- **采样率**：协商成功 → 16 kHz 主档；失败 → 8 kHz 降级档；通过 `{"type":"audio","event":"start","sample_rate":N}` 告知 Mac
-- **录音上限**：60 秒硬切，防按键卡住
+- **链路协商**：连接建立后固件请求 2M PHY + MTU 517（notify payload 上限 500 B）+ DLE 251 + conn interval 7.5–15ms，结果通过 `{"type":"link","phy":"...","mtu":...}` 上报
+- **采样率**：固定 16 kHz，无降级档。2M PHY 是硬性前提——协商不到 2M 时 `recorderStart()` 直接拒绝录音而不是降级，让问题暴露而不是藏起来（见 `ble_bridge.h` 顶部注释）。仍通过 `{"type":"audio","event":"start","sample_rate":N}` 告知 Mac
+- **录音上限**：60 秒硬切（`recorder.cpp` `MAX_RECORD_MS`），防按键卡住烧豆包时长费；触发时走正常 stop 流程，已说的话照常转写
 
 ## 关键设计决策
 

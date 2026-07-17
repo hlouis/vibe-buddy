@@ -12,6 +12,15 @@ static constexpr uint32_t SAMPLE_RATE = 16000;
 static constexpr size_t RING_SAMPLES = 16384;   // 32 KB @ int16
 static constexpr size_t CHUNK_SAMPLES = 512;    // 32 ms per mic read
 
+// Hard cap on a single session. A physically stuck BtnA (or one wedged
+// by a wet finger / case pressure) otherwise records forever: the mic
+// stays hot, we blast 32 KB/s over BLE, and the Mac holds a Doubao
+// WebSocket open indefinitely — which bills per second. We stop rather
+// than cancel so whatever was said in the window still gets transcribed.
+// The host's PTTSession watchdog (maxHoldSec = 30) only covers
+// host-side triggers; nothing upstream watches the device button.
+static constexpr uint32_t MAX_RECORD_MS = 60000;
+
 // Ping-pong buffers fed into M5.Mic.record(). With a single buffer,
 // M5Unified's async queue can race: record() returns immediately after
 // queueing, and isRecording() may briefly read false before DMA actually
@@ -28,6 +37,7 @@ static volatile bool   stopPending = false;
 static volatile uint16_t frameSeq = 0;
 static volatile uint32_t bytesSent = 0;
 static volatile uint32_t overruns = 0;
+static volatile uint32_t startedAt = 0;
 
 // ES8311 codec lifecycle. Power-on is non-trivial (~50-100 ms incl. PLL
 // lock + DMA setup) but holding the codec live across long idle periods
@@ -171,6 +181,7 @@ void recorderStart() {
   bytesSent = 0;
   overruns = 0;
   stopPending = false;
+  startedAt = millis();
   active = true;
 
   char buf[80];
@@ -224,6 +235,17 @@ uint32_t recorderOverruns()    { return overruns; }
 // frames until empty or until bleWrite backpressure slows us.
 void recorderTick() {
   if (!ring) return;
+
+  // Enforce the session cap before draining, so this tick already starts
+  // flushing the tail. recorderStop() is safe to call under a still-held
+  // BtnA: main.cpp's release path calls it again and it no-ops on
+  // !active, and start only ever fires on a press edge — so a stuck
+  // button stays stopped instead of immediately re-arming.
+  if (active && millis() - startedAt >= MAX_RECORD_MS) {
+    Serial.printf("[rec] hit %us cap — forcing stop (button stuck?)\n",
+                  (unsigned)(MAX_RECORD_MS / 1000));
+    recorderStop();
+  }
 
   // Derive max PCM payload from the live MTU. Frame header = 6 bytes, and
   // ble_bridge internally caps notify payload at 244. Keep payload even
