@@ -62,13 +62,17 @@ open:                         ## open the umbrella workspace in Xcode
 
 # --- firmware --------------------------------------------------------------
 
-.PHONY: fw fw-upload fw-monitor
+.PHONY: fw fw-upload fw-monitor fw-capture
 
 fw:                           ## build firmware (needs: platformio)
 	cd firmware && pio run
 
 fw-upload:                    ## flash firmware to attached M5Stack (needs: platformio)
 	cd firmware && pio run -t upload
+
+fw-capture:                   ## capture serial to a file, backgroundable (needs: platformio)
+	@PY=$$(ls /opt/homebrew/opt/platformio/libexec/bin/python 2>/dev/null || command -v python3); \
+	$$PY tools/fw_capture.py $(ARGS)
 
 fw-monitor:                   ## tail the firmware serial log (needs: platformio)
 	cd firmware && pio device monitor

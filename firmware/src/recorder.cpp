@@ -42,14 +42,16 @@ static constexpr size_t OPUS_MAX_PACKET = 256;
 // every ~2 ms, so 4 frames/tick is ~200 frames/s of drain capacity
 // against the 16.7 frames/s the mic actually produces — over 10x margin.
 //
-// Measured on hardware: one 60 ms frame costs ~19.4 ms to encode at
-// complexity 1 on a 240 MHz S3 — 32% of realtime, not the 2-5 ms guessed
-// when this was written. Two implicit dependencies fall out of that, so
-// they're written down here rather than rediscovered the hard way:
+// Measured on hardware: one 60 ms frame costs 19-22 ms to encode at
+// complexity 1 on a 240 MHz S3 — a third of realtime, not the 2-5 ms
+// guessed when this was written. It varies with content (silence is
+// cheaper than speech), so treat the high end as the real number.
+// Two implicit dependencies fall out of that, so they're written down
+// here rather than rediscovered the hard way:
 //
 //  1. CPU stays at 240 MHz for the whole session. main.cpp's DFS keys on
 //     recorderActive(), so this holds today — but at 80 MHz the same
-//     frame would cost ~58 ms and sit right on the 60 ms budget.
+//     frame would cost ~66 ms and blow the 60 ms budget outright.
 //  2. OPUS_SET_COMPLEXITY stays low. Raising it eats the margin directly.
 //
 // Break either and encoding goes slower than realtime; the cap is then

@@ -68,8 +68,12 @@ vibe-buddy/
 │   │       ├── InjectionScript.swift  # 焦点跟踪 / 增量注入 / 键盘抑制 JS
 │   │       └── WebViewInjector.swift  # 通过 WebPage.callJavaScript 应用 diff
 │   └── VibeBuddyTests/             # 单元测试基线（~80 用例）
-└── tools/
-    └── ble_audio_dump.py           # 纯 BLE 端到端验证脚本（bleak 客户端）
+├── tools/
+│   ├── ble_audio_dump.py           # 纯 BLE 端到端验证脚本（bleak 客户端）
+│   ├── fw_capture.py               # 可后台的串口录制（fw-monitor 需要 TTY，用不了）
+│   └── verify_ogg_mux.py           # 真 Opus 包 → 我们的 muxer → ffmpeg 解码
+└── docs/
+    └── hardware-debug.md           # 硬件调试流程 / 崩溃诊断 / 症状伪装对照表
 ```
 
 ## 硬件
@@ -210,15 +214,20 @@ iOS 限制说明：
 ## 单元测试
 
 ```bash
-make test           # 共享 SwiftPM 测试 + iOS App 测试
-make test-shared    # 只跑 VibeBuddyCore（Gzip / Config / AudioStreamer / STTService）
+make test           # 共享 SwiftPM 测试 + Ogg 封装验证 + iOS App 测试
+make test-shared    # 只跑 VibeBuddyCore（Gzip / Config / AudioStreamer / OggOpusMuxer / …）
+make test-ogg       # 真 Opus 包 → 我们的 muxer → ffmpeg 解码（需要 ffmpeg）
 make test-ios       # 只跑 iOS App 端（TextRouter / PasteboardHandler / TextDiff /
                     #                  InjectionScript / BookmarkStore 等）
 ```
 
-测试不依赖真硬件。SwiftUI WebView 的 JS 注入（包含焦点跟踪、increment diff、键盘抑制）需要在真机或模拟器上手动验证。
+**以上全部跑在主机上，一项都碰不到设备。** 单测只能验证我们自己写下的断言——Ogg EOS 页那个 bug 就是单测断言了错误假设还全绿，靠 `make test-ogg` 的真解码器才抓到；而 `opus_encode` 撑爆固件栈那个，三层主机检查全绿，只有真机能抓到。
+
+固件改动 **必须** 走真机验证，流程见 [docs/hardware-debug.md](docs/hardware-debug.md)。SwiftUI WebView 的 JS 注入（焦点跟踪、increment diff、键盘抑制）同样需要真机或模拟器手动验证。
 
 ## 调试工具
+
+完整的硬件调试流程、崩溃诊断、以及「主机侧症状 → 真实原因」对照表见 **[docs/hardware-debug.md](docs/hardware-debug.md)**。下面是速查。
 
 ### 纯 BLE 验证（不走豆包）
 
@@ -239,18 +248,30 @@ afplay out.ogg
 ### 固件日志
 
 ```bash
-make fw-monitor
+make fw-monitor                              # 交互式盯屏
+make fw-capture &                            # 后台录到 /tmp/vibebuddy-serial.txt
+make fw-capture ARGS="--reset --seconds 10"  # 复位后录，抓 [boot] / 崩溃 backtrace
 ```
 
-关键标签：`[boot]` / `[ble]` / `[link]` / `[rec]` / `[mic]` / `[tick]` / `[rec-tick]`
+`make fw-monitor` 需要 TTY，后台跑或重定向会直接抛 traceback——要挂着录就用 `fw-capture`。
+
+关键标签：`[boot]` / `[ble]` / `[link]` / `[rec]` / `[mic]` / `[tick]` / `[pwr]`
+
+**`[tick]` 是判断设备有没有崩过的关键**：它每秒 +1，从 boot 起算。烧录十几分钟后 tick 却只有十几 = 刚重启过。
 
 ### macOS 日志
 
 ```bash
-log stream --predicate 'process == "VibeBuddy"' --style compact
+APP=$(ls -d ~/Library/Developer/Xcode/DerivedData/VibeBuddy-macOS-*/Build/Products/Debug/VibeBuddy.app)
+open --stdout /tmp/vb.txt --stderr /tmp/vb.txt "$APP"
 ```
 
 关键标签：`[ble]` / `[json]` / `[audio]` / `[stt]`
+
+两个坑，都会浪费你半小时：
+
+- **`log stream --predicate 'process == "VibeBuddy"'` 看不到我们的 NSLog**，只有系统框架的日志。别试了
+- **不要直接跑 `VibeBuddy.app/Contents/MacOS/VibeBuddy`**：TCC 会把蓝牙权限归属到父终端，终端没授权的话 `CBCentralManager` 永远不 poweredOn，程序活着但一条 `[ble]` 都没有。`open --stderr` 保留 App 自己的 TCC 归属，不用改任何系统设置
 
 ### iOS 日志
 
@@ -271,8 +292,22 @@ iOS 端关键标签：`[ble]` / `[stt]` / `[wv]`（WebView 注入）。模拟器
 
 ## 关键设计决策
 
-几处踩坑经验：
+### 设备端 Opus，主机永不解码
 
+音频在 StickS3 上就编成 Opus（CBR 20 kbps / 60 ms 帧），主机只负责封 Ogg 转发给豆包。**BLE 上的音频从 32 KB/s 降到 ~2.5 KB/s，实测 12 倍。**
+
+为什么主机不解码：muxing 是纯字节拼装，decoding 不是。不解码 = `shared/` 不需要引 libopus（目前是纯 Swift + Foundation），iOS/macOS 都不用打包原生依赖。
+
+代价是**管道分叉**：麦克风音源仍是 PCM，所以 `AudioStreamer` 按 session codec 分流——Opus 按整包 trim（60 ms 粒度，200 ms 窗口向上取整成 4 包），PCM 按字节 trim 再切 200 ms chunk。两条路在 `emitToSinks` 汇合，warmup 门控完全共用。这是权衡后接受的：另一条路（主机解码回 PCM，单管道）要在两个平台上引入 libopus。
+
+向后兼容：`codec` 是 `audio/start` JSON 的**新增字段，缺失即 PCM**，所以旧固件配新 App 照常工作。
+
+**硬约束（实测，别破）**：一帧 60 ms 音频编码要 **19–22 ms**（240 MHz / complexity 1），占实时预算三分之一，且随内容波动。因此录音全程必须锁 240 MHz（`main.cpp` 的 DFS 按 `recorderActive()` 拉满，80 MHz 下要 ~66 ms 直接超预算），且 complexity 不能上调。破了会让编码慢于实时，`recorder.cpp` 的 `MAX_ENCODES_PER_TICK = 4` 是最后一道闸。细节见 [docs/hardware-debug.md](docs/hardware-debug.md)。
+
+### 几处踩坑经验
+
+- `loopTask` 默认栈只有 8 KB，`opus_encode()` 直接捅穿 → `SET_LOOP_TASK_STACK_SIZE(32 * 1024)`。**这个崩溃从主机侧看是「BLE 4 秒超时断连」**，因为设备崩溃时不发 disconnect PDU
+- Ogg EOS 页必须声明**零个** lacing segment，不是「一个长度为 0 的 segment」——后者等于声明一个零字节包，Opus 里不存在，ffmpeg 拒收整个流。单测断言过这个 bug 且全绿，是 `make test-ogg` 抓到的
 - StickS3 的扬声器与麦克风共享 ES8311，用 `cfg.internal_spk = false` 释放 I2S
 - M5Unified 的 `M5.Mic.record()` 异步 API 用单缓冲会产生 chunk 重复 → 用 ping-pong
 - BLE 默认 LL PDU 27 字节会把 500 B notify 拆 20 段，必须显式调 `esp_ble_gap_set_prefered_default_phy` + `esp_ble_gap_set_pkt_data_len(251)`

@@ -91,12 +91,24 @@ CGEvent + 最长公共前缀 diff，按 partial 增量打字。`FocusGate.swift`
 - **iOS 26 / iPadOS 26** 是硬下限（SwiftUI WebView）。要支持更低版本得整体回退到 WKWebView。
 - **macOS 14 (Sonoma)** 是下限（CoreBluetooth + Accessibility 行为）。
 - 麦克风 / BLE 音源切换之后，旧音源必须停干净——任何"start 了没 stop"的路径都会导致系统麦指示灯常亮、电量异常或 GATT 通道占用。审改 `MicCaptureController` / `AudioSourceCoordinator` / `PTTSession` 时第一反射就是检查"释放对称"。
-- 固件侧 BLE 协商参数（2M PHY、MTU 247、DLE 251、conn interval 7.5–15ms）是端到端 <1s 延迟的前提，详细 trade-off 在 README "BLE 协议要点" + "关键设计决策"。
+- 固件侧 BLE 协商参数（2M PHY、MTU 517、DLE 251、conn interval 7.5–15ms）是端到端 <1s 延迟的前提，详细 trade-off 在 README "BLE 协议要点" + "关键设计决策"。
+- **Opus 编码有实测的时间预算**：一帧 60ms 音频要 19–22ms（240MHz / complexity 1，随内容波动），占实时的三分之一。因此录音全程必须锁 240MHz（`main.cpp` 的 DFS 按 `recorderActive()` 拉满；80MHz 下要 ~66ms 直接超预算）且 complexity 不能上调——破了会让编码慢于实时，`MAX_ENCODES_PER_TICK` 是最后一道闸。改 codec 参数或调频策略后回来看 `[rec] stopped` 里的 `enc=` 数字。
+- **`loopTask` 默认栈 8KB**，`opus_encode()` 会捅穿 → `main.cpp` 顶部的 `SET_LOOP_TASK_STACK_SIZE(32*1024)`。任何要在 `loop()` 里调的重型库都得先想栈。
 - 提交规范看用户全局 CLAUDE.md（Conventional Commits，scope 用域名，描述中文，不要 Co-Author / Claude Code 字样，**不要主动 commit/push**）。
+
+## 固件改动必须真机验证
+
+**主机侧的绿灯只证明主机侧没问题。** 三层验证各有盲区：单测只验证我们自己写下的断言（Ogg EOS 那个 bug 被单测断言成了正确行为，全绿）；`make test-ogg` 用真 ffmpeg 抓到了单测抓不到的；而 `opus_encode` 撑爆固件栈那个，三层主机检查全绿，只有真机能抓。
+
+崩溃还会伪装：设备崩溃时不发 disconnect PDU，所以主机看到的是「BLE 4 秒后超时断连」，读起来像链路问题。**流程、症状对照表、环境陷阱全在 `docs/hardware-debug.md`——改固件前先读。**
 
 ## 调试工具
 
-- **纯 BLE 验证（不走豆包）**：`tools/ble_audio_dump.py`（bleak 客户端）抓音频落盘，绕开 App + ASR。固件发 Opus 时自动封成可直接播放的 `out.ogg`。详见 README "调试工具"。
+**完整流程见 `docs/hardware-debug.md`。** 速查：
+
+- **串口**：`make fw-monitor` 交互式；`make fw-capture &` 后台录到 `/tmp/vibebuddy-serial.txt`（`fw-monitor` 需要 TTY，后台跑会抛 traceback）；`make fw-capture ARGS="--reset --seconds 10"` 抓启动/崩溃。关键标签 `[boot] [ble] [link] [rec] [mic] [tick] [pwr]`——**`[tick]` 是判断设备崩没崩过的关键**（1Hz 递增，跑了十几分钟却只有十几 = 刚重启）。
+- **macOS App 日志**：`open --stdout /tmp/vb.txt --stderr /tmp/vb.txt <VibeBuddy.app>`。**`log stream --predicate 'process == "VibeBuddy"'` 看不到我们的 NSLog**；**直接跑二进制会因 TCC 归属到终端而拿不到蓝牙权限**（程序活着但没有任何 `[ble]` 输出）。
+- **纯 BLE 验证（不走豆包）**：`tools/ble_audio_dump.py`（bleak 客户端）抓音频落盘，绕开 App + ASR。固件发 Opus 时自动封成可直接播放的 `out.ogg`。bleak 的蓝牙权限归属到终端 App，需要在系统设置里放行。
 - **Ogg 封装验证**：`make test-ogg` —— 真 Opus 包 → 我们的 muxer → ffmpeg 解码 → 检查音调还在。
 - **macOS 日志**：`log stream --predicate 'process == "VibeBuddy"' --style compact`，关键标签 `[ble] [json] [audio] [stt]`。
 - **iOS 日志**：模拟器在 Xcode console 看，真机用 Console.app 按 `VibeBuddy` 过滤。关键标签 `[ble] [stt] [wv]`。
