@@ -19,6 +19,7 @@ static volatile size_t rxTail = 0;
 static BLEServer*         server = nullptr;
 static BLECharacteristic* txChar = nullptr;
 static BLECharacteristic* rxChar = nullptr;
+static BLE2902*           txCccd = nullptr;
 static volatile bool      connected = false;
 static volatile uint16_t  mtu = 23;
 static volatile uint8_t   txPhy = 1;    // 1 = 1M, 2 = 2M, 3 = coded
@@ -168,7 +169,8 @@ void bleInit(const char* deviceName) {
     NUS_TX_UUID,
     BLECharacteristic::PROPERTY_NOTIFY
   );
-  txChar->addDescriptor(new BLE2902());
+  txCccd = new BLE2902();
+  txChar->addDescriptor(txCccd);
 
   rxChar = svc->createCharacteristic(
     NUS_RX_UUID,
@@ -188,6 +190,11 @@ void bleInit(const char* deviceName) {
 }
 
 bool bleConnected() { return connected; }
+
+// True once the peer has written the CCCD, i.e. notifications will
+// actually go somewhere. A notify sent before this is silently dropped
+// by the stack — there's no subscriber to deliver it to.
+bool bleSubscribed() { return connected && txCccd && txCccd->getNotifications(); }
 uint16_t bleMtu()   { return mtu; }
 
 const char* blePhy() {

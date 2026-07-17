@@ -274,11 +274,13 @@ extension BLEController: CBCentralManagerDelegate {
             let name = peripheral.name ?? "?"
             NSLog("[ble] connected to %@", name)
             self.state?.link = .connected(name)
-            // Record MTU before service discovery because it's known as
-            // soon as the link is up; the device-side PHY is surfaced via
-            // the {"type":"link"} JSON event we'll see on subscription.
-            let mtu = peripheral.maximumWriteValueLength(for: .withoutResponse)
-            self.state?.linkParams.mtu = mtu
+            // Deliberately NOT reading maximumWriteValueLength here. The
+            // ATT MTU exchange has not happened yet at didConnect, so it
+            // returns the 23-byte default minus 3 — and the old comment
+            // here claimed the opposite ("known as soon as the link is
+            // up"), which is how the UI ended up pinned at "MTU 20" on a
+            // 517-byte link. Read it after subscribing instead; the
+            // authoritative value is the device's own {"type":"link"}.
             peripheral.discoverServices([Self.nusService])
         }
     }
@@ -338,7 +340,14 @@ extension BLEController: CBPeripheralDelegate {
                 if c.uuid == Self.txChar {
                     self.txCharacteristic = c
                     peripheral.setNotifyValue(true, for: c)
-                    NSLog("[ble] subscribed to TX")
+                    // By now the ATT MTU exchange has settled, so this is
+                    // a real number rather than the 20 didConnect would
+                    // have given us. The device's {"type":"link"} frame
+                    // overwrites it a moment later and is authoritative;
+                    // this is the fallback for when that frame is missed.
+                    let mtu = peripheral.maximumWriteValueLength(for: .withoutResponse)
+                    self.state?.linkParams.mtu = mtu
+                    NSLog("[ble] subscribed to TX (mtu=%d)", mtu)
                 }
             }
         }
@@ -398,7 +407,14 @@ extension BLEController: CBPeripheralDelegate {
         // We don't pull in a full JSON parser for these: the firmware
         // emits a small closed set of message shapes and cheap substring
         // matching is plenty. Step 6 will formalize this with Codable.
-        if line.contains("\"type\":\"link\"") {
+        // Link params ride the 1 Hz heartbeat rather than a one-shot
+        // announcement on connect. The old {"type":"link"} frame was sent
+        // the moment the PHY settled, which is before CoreBluetooth has
+        // finished setNotifyValue() — the notify was then dropped with no
+        // error and never retried, leaving this stuck on "? PHY / MTU 20"
+        // over a healthy link about half the time. A fact worth showing
+        // continuously doesn't belong in a fire-and-forget message.
+        if line.contains("\"type\":\"hb\"") {
             if let phy = extractString(from: line, key: "phy") { state?.linkParams.phy = phy }
             if let mtu = extractInt(from: line, key: "mtu")    { state?.linkParams.mtu = mtu }
             return

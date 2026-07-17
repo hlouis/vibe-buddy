@@ -21,7 +21,6 @@ static char deviceName[20] = "VibeBuddy";
 static bool btnAHeld = false;
 static uint32_t lastHeartbeat = 0;
 static uint32_t heartbeatCount = 0;
-static bool linkReported = false;
 
 // Button discrimination:
 // BtnA — click (< CLICK_MS_A) = newline,  hold = start/stop recording
@@ -433,13 +432,28 @@ static void drainRx() {
   }
 }
 
+// Carries the link params rather than announcing them once on connect.
+//
+// The old {"type":"link"} one-shot lost a race roughly half the time: it
+// fired as soon as the PHY settled, and a notify that lands before
+// CoreBluetooth has finished setNotifyValue() is dropped with no error
+// and no retry — so the app sat on "? PHY / MTU 20" over a healthy
+// 2M/517 link. Gating on the CCCD being written wasn't enough; the
+// device saw the subscription, sent the frame, and it still vanished.
+//
+// A one-shot with no ack and no retransmit is the wrong shape for this.
+// The heartbeat is already here, already 1 Hz, already idempotent — so
+// the link params ride along and the app is correct within a second of
+// anything, from any starting state. No race left to lose.
 static void sendHeartbeat() {
   if (!bleConnected()) return;
-  char buf[96];
+  char buf[128];
   int n = snprintf(buf, sizeof(buf),
-                   "{\"type\":\"hb\",\"seq\":%u,\"btn_a\":%s}\n",
+                   "{\"type\":\"hb\",\"seq\":%u,\"btn_a\":%s,"
+                   "\"phy\":\"%s\",\"mtu\":%u}\n",
                    (unsigned)heartbeatCount,
-                   btnAHeld ? "true" : "false");
+                   btnAHeld ? "true" : "false",
+                   blePhy(), (unsigned)bleMtu());
   bleWrite((const uint8_t*)buf, (size_t)n);
 }
 
@@ -450,17 +464,6 @@ static void sendEditAction(const char* action) {
                    "{\"type\":\"edit\",\"action\":\"%s\"}\n", action);
   bleWrite((const uint8_t*)buf, (size_t)n);
   Serial.printf("[edit] %s\n", action);
-}
-
-static void maybeReportLink() {
-  if (!bleLinkReady() || linkReported) return;
-  char buf[64];
-  int n = snprintf(buf, sizeof(buf),
-                   "{\"type\":\"link\",\"phy\":\"%s\",\"mtu\":%u}\n",
-                   blePhy(), (unsigned)bleMtu());
-  bleWrite((const uint8_t*)buf, (size_t)n);
-  linkReported = true;
-  Serial.printf("[link] ready: phy=%s mtu=%u\n", blePhy(), (unsigned)bleMtu());
 }
 
 void setup() {
@@ -562,8 +565,6 @@ void loop() {
 
   drainRx();
 
-  if (!bleConnected()) linkReported = false;
-  maybeReportLink();
 
   recorderTick();
 

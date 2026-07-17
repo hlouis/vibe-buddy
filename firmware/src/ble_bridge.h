@@ -15,6 +15,10 @@
 
 void bleInit(const char* deviceName);
 bool bleConnected();
+// Peer has enabled notifications on the TX characteristic. Anything sent
+// before this is dropped on the floor, so one-shot messages must wait for
+// it — see maybeReportLink().
+bool bleSubscribed();
 uint16_t bleMtu();                 // negotiated ATT MTU, 23 until upgraded
 
 // PHY negotiation state. We request 2M on every new connection because
