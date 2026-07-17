@@ -29,6 +29,33 @@ static constexpr int OPUS_FRAME_SAMPLES = 960;
 static constexpr int OPUS_BITRATE = 20000;
 static constexpr size_t OPUS_MAX_PACKET = 256;
 
+// Ceiling on frames encoded per recorderTick(). The drain condition is
+// "ring has >= one frame", and the mic task on core 1 refills it at one
+// frame per 60 ms — so if encoding were ever slower than realtime, an
+// unbounded loop would never see the ring empty and would never return.
+// The main loop (and with it the BLE stack, on the same core) would
+// starve, and the host would see the link die on supervision timeout
+// with no crash to explain it.
+//
+// The cap turns that into a graceful degradation instead: the ring backs
+// up, the existing overrun path drops oldest and logs it. loop() spins
+// every ~2 ms, so 4 frames/tick is ~200 frames/s of drain capacity
+// against the 16.7 frames/s the mic actually produces — over 10x margin.
+//
+// Measured on hardware: one 60 ms frame costs ~19.4 ms to encode at
+// complexity 1 on a 240 MHz S3 — 32% of realtime, not the 2-5 ms guessed
+// when this was written. Two implicit dependencies fall out of that, so
+// they're written down here rather than rediscovered the hard way:
+//
+//  1. CPU stays at 240 MHz for the whole session. main.cpp's DFS keys on
+//     recorderActive(), so this holds today — but at 80 MHz the same
+//     frame would cost ~58 ms and sit right on the 60 ms budget.
+//  2. OPUS_SET_COMPLEXITY stays low. Raising it eats the margin directly.
+//
+// Break either and encoding goes slower than realtime; the cap is then
+// the only thing keeping loop() returning at all.
+static constexpr int MAX_ENCODES_PER_TICK = 4;
+
 // Hard cap on a single session. A physically stuck BtnA (or one wedged
 // by a wet finger / case pressure) otherwise records forever: the mic
 // stays hot, we blast 32 KB/s over BLE, and the Mac holds a Doubao
@@ -55,6 +82,11 @@ static volatile uint16_t frameSeq = 0;
 static volatile uint32_t bytesSent = 0;
 static volatile uint32_t overruns = 0;
 static volatile uint32_t startedAt = 0;
+// Last opus_encode() duration. Surfaced in the stop log: the budget is
+// 60000 us (one frame of audio per frame of wall clock) and anything
+// approaching that means the drain cap above is the only thing between
+// us and a starved BLE stack.
+static volatile uint32_t encodeUs = 0;
 
 // ES8311 codec lifecycle. Power-on is non-trivial (~50-100 ms incl. PLL
 // lock + DMA setup) but holding the codec live across long idle periods
@@ -352,7 +384,9 @@ void recorderTick() {
   // the trailing window anyway (release click), padding it would be
   // fabricating audio nobody will ever hear. Leftovers < 960 samples are
   // dropped at stop.
-  while (opusEnc && ringAvail() >= (size_t)OPUS_FRAME_SAMPLES) {
+  int encoded = 0;
+  while (opusEnc && encoded < MAX_ENCODES_PER_TICK &&
+         ringAvail() >= (size_t)OPUS_FRAME_SAMPLES) {
     for (int i = 0; i < OPUS_FRAME_SAMPLES; i++) {
       encBuf[i] = ring[(ringTail + i) % RING_SAMPLES];
     }
@@ -360,7 +394,10 @@ void recorderTick() {
     // these samples can never be re-encoded into an equivalent packet.
     ringTail = (ringTail + OPUS_FRAME_SAMPLES) % RING_SAMPLES;
 
+    uint32_t t0 = micros();
     int n = opus_encode(opusEnc, encBuf, OPUS_FRAME_SAMPLES, pkt, sizeof(pkt));
+    encodeUs = micros() - t0;
+    encoded++;
     if (n < 0) {
       Serial.printf("[rec] opus_encode failed: %d\n", n);
       continue;
@@ -378,8 +415,9 @@ void recorderTick() {
     stopPending = false;
     const char* s = "{\"type\":\"audio\",\"event\":\"stop\"}\n";
     bleWrite((const uint8_t*)s, strlen(s));
-    Serial.printf("[rec] stopped: frames=%u bytes=%u overruns=%u\n",
-                  (unsigned)frameSeq, (unsigned)bytesSent, (unsigned)overruns);
+    Serial.printf("[rec] stopped: frames=%u bytes=%u overruns=%u enc=%uus/60000us\n",
+                  (unsigned)frameSeq, (unsigned)bytesSent, (unsigned)overruns,
+                  (unsigned)encodeUs);
     // Drain done — release the codec. Recorder task will pick this up
     // on its next idle pass and call M5.Mic.end() safely.
     micShutdownPending = true;

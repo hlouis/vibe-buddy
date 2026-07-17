@@ -4,6 +4,19 @@
 #include "ble_bridge.h"
 #include "recorder.h"
 
+// recorderTick() runs opus_encode() from loop(), and libopus wants far
+// more stack than Arduino's 8 KB default for loopTask: the first encode
+// of the first session blew it every time, which the ESP32 reports as
+//
+//   ***ERROR*** A stack overflow in task loopTask has been detected.
+//
+// then reboots. From the Mac's side that looked nothing like a crash —
+// the device stopped sending mid-session and the link only died 4 s
+// later on supervision timeout, so it read as "BLE went quiet".
+// 32 KB is generous; RAM is at ~17% and the alternative failure mode is
+// a reboot loop nobody can diagnose from the host side.
+SET_LOOP_TASK_STACK_SIZE(32 * 1024);
+
 static char deviceName[20] = "VibeBuddy";
 static bool btnAHeld = false;
 static uint32_t lastHeartbeat = 0;
