@@ -11,11 +11,18 @@ import Foundation
 // 16 kHz / mono / Int16 PCM that AudioStreamer + Doubao expect, and
 // hands raw PCM to AudioStreamer.ingestPCM().
 //
-// Lifecycle is decoupled from sessions: the engine runs continuously
-// while mic mode is active, and the gating between "buffering vs
-// silently dropping" is done by AudioStreamer.active (toggled by PTT
-// start/stop/cancel). That avoids the 100–300 ms warm-up latency we'd
-// pay if we started the engine on every PTT press.
+// Lifecycle is bound to the PTT press edge: AudioSourceCoordinator
+// calls start() on .start and stop() on .stop / .cancel. The engine
+// is NOT held open between presses — that would keep the system mic
+// indicator (iOS orange dot / macOS status-bar pill) lit the entire
+// time mic mode is selected, which looks like the app is always
+// listening.
+//
+// Cost of on-demand start: AVAudioEngine warmup is 100–300 ms before
+// the tap delivers its first buffer. AudioStreamer already gates STT
+// with a 400 ms warmup window (see AudioStreamer.sttWarmupMs), so the
+// engine warmup overlaps it and first-syllable audio is not lost in
+// any user-perceptible way.
 //
 // Cross-platform notes:
 // • macOS: AVAudioEngine works directly off the default input device;

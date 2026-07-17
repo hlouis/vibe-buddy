@@ -65,21 +65,21 @@ final class AudioSourceCoordinator: ObservableObject {
     }
 
     // Called by VibeBuddyApp on scenePhase != .active. AudioStreamer's
-    // existing cancel takes care of any open session; here we only need
-    // to release the engine + audio session if we were in mic mode.
+    // existing cancel takes care of any open session; here we tear down
+    // the trigger and force-release the engine in case a press was
+    // in flight when we got backgrounded.
     func handleAppBackgrounded() {
         guard let state, state.audioSource == .mic else { return }
-        NSLog("[coord] app backgrounded — stopping mic engine")
+        NSLog("[coord] app backgrounded — disabling mic trigger")
         pttTrigger.disable()
-        mic.stop()
+        mic.stop()  // idempotent; covers mid-press backgrounding
         state.micRunning = false
         state.hotkeyEnabled = false
     }
 
-    // Re-arm mic + trigger when the user returns to the app, but only
-    // if they're still in mic mode and the engine got torn down by
-    // backgrounding. This avoids "I came back and the button does
-    // nothing" puzzlement.
+    // Re-arm the trigger when the user returns to the app. Engine
+    // itself stays off until next PTT press — same on-demand model
+    // as cold start.
     func handleAppForegrounded() {
         guard let state, state.audioSource == .mic else { return }
         if !state.micRunning {
@@ -155,36 +155,54 @@ final class AudioSourceCoordinator: ObservableObject {
         }
         state.hotkeyError = ""
 
-        // 2. Start engine. Configures AVAudioSession internally, then
-        //    spins up AVAudioEngine. Always-on while mic mode is active
-        //    so PTT press latency is just a function call.
-        do {
-            try mic.start()
-            state.micRunning = true
-        } catch {
-            state.micRunning = false
-            state.hotkeyError = "麦克风启动失败：\(error.localizedDescription)"
-            return
-        }
-
-        // 3. Arm the button trigger. enable() can't fail on iOS (no
+        // 2. Arm the button trigger. enable() can't fail on iOS (no
         //    OS-level resource to acquire) — kept in a do/try to mirror
         //    the macOS path and tolerate future trigger types.
+        //
+        //    The audio engine is NOT started here. We start it on each
+        //    PTT press in handlePTT(.start) and tear it down on release
+        //    so the iOS orange mic indicator only lights up while the
+        //    user is actually holding the button. The 100–300 ms warmup
+        //    overlaps with AudioStreamer's 400 ms STT warmup window so
+        //    there's no perceptible loss of first-syllable audio.
         do {
             try pttTrigger.enable()
             state.hotkeyEnabled = true
+            state.micRunning = true   // "mic mode ready", not "engine on"
         } catch {
             state.hotkeyEnabled = false
+            state.micRunning = false
             state.hotkeyError = error.localizedDescription
         }
     }
 
     // MARK: PTT -> AudioStreamer
+    //
+    // Engine lifecycle is bound to the press edge, not the mode. Order
+    // matters:
+    //   • on .start, bring up the engine first; if it fails we don't
+    //     start a session that has no audio source.
+    //   • on .stop / .cancel, drain the streamer first (it flushes the
+    //     last chunk and closes the STT session), then release the
+    //     engine. Tap callbacks already in flight hit `active == false`
+    //     in ingestPCM and get dropped — at most one ~21 ms tap buffer.
 
     private func handlePTT(_ event: PTTEvent) {
-        // Mic mode: tailTrimMs = 0 so we don't clip the user's last
-        // syllable when they release the button.
-        ble.audio.handlePTT(event, tailTrimMs: 0)
+        switch event {
+        case .start:
+            do {
+                try mic.start()
+            } catch {
+                state?.hotkeyError = "麦克风启动失败：\(error.localizedDescription)"
+                return
+            }
+            // Mic mode: tailTrimMs = 0 so we don't clip the user's last
+            // syllable when they release the button.
+            ble.audio.handlePTT(event, tailTrimMs: 0)
+        case .stop, .cancel:
+            ble.audio.handlePTT(event, tailTrimMs: 0)
+            mic.stop()
+        }
     }
 
     // MARK: interruption
@@ -200,7 +218,7 @@ final class AudioSourceCoordinator: ObservableObject {
             NSLog("[coord] audio session interrupted — cancelling")
             ble.audio.cancelSession()
             pttTrigger.disable()
-            mic.stop()
+            mic.stop()  // idempotent; only does work if a press was in flight
             state?.micRunning = false
             state?.hotkeyEnabled = false
         case .ended:

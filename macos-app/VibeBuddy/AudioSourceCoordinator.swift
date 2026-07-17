@@ -17,10 +17,11 @@ import VibeBuddyCore
 //
 // Mic mode:
 //   - MicCaptureController taps AVAudioEngine and streams 16 kHz Int16
-//     PCM into AudioStreamer.ingestPCM(). The engine runs continuously;
-//     the actual session boundary is driven by HotKeyPTTTrigger calling
-//     handlePTT(.start/.stop/.cancel). tailTrimMs is forced to 0 here
-//     because there is no button click to clip.
+//     PCM into AudioStreamer.ingestPCM(). The engine is brought up on
+//     each PTT press and torn down on release so the macOS status-bar
+//     mic indicator is only lit while the user is actually holding the
+//     hotkey. tailTrimMs is forced to 0 here because there is no button
+//     click to clip.
 //
 // Switching cancels any in-flight session before swapping pipelines so
 // AudioStreamer's `active` invariant is never violated.
@@ -172,18 +173,7 @@ final class AudioSourceCoordinator: ObservableObject {
             return
         }
 
-        // 2. Start the audio engine. Always-on while in mic mode so
-        //    PTT press latency is just a CGEvent dispatch.
-        do {
-            try mic.start()
-            state.micRunning = true
-        } catch {
-            state.micRunning = false
-            state.hotkeyError = "麦克风启动失败：\(error.localizedDescription)"
-            return
-        }
-
-        // 3. Input Monitoring permission. Check first so we know what
+        // 2. Input Monitoring permission. Check first so we know what
         //    UI to show; if not yet granted, IOHIDRequestAccess pops
         //    the system prompt AND adds VibeBuddy to System Settings →
         //    Privacy → Input Monitoring (where the user can flip the
@@ -200,16 +190,26 @@ final class AudioSourceCoordinator: ObservableObject {
         }
         state.inputMonitoringAuth = imAuth
 
-        // 4. Hook up the global hotkey. If Input Monitoring isn't
+        // 3. Hook up the global hotkey. If Input Monitoring isn't
         //    granted yet, tapCreate will fail and we surface the error
         //    + a deep-link button. The auto-recover path in
         //    refreshPermissionsOnFocus() picks it up later.
+        //
+        //    The audio engine is NOT started here — it gets brought up
+        //    lazily on each PTT press in handleHotkeyPTT(.start) and
+        //    torn down on release, so the status-bar mic indicator
+        //    only lights up while the user is actually holding the
+        //    hotkey. The 100–300 ms warmup overlaps AudioStreamer's
+        //    400 ms STT warmup window, so first-syllable audio is
+        //    not perceptibly clipped.
         do {
             try hotkey.enable()
             state.hotkeyEnabled = true
+            state.micRunning = true   // "mic mode ready", not "engine on"
             state.hotkeyError = ""
         } catch {
             state.hotkeyEnabled = false
+            state.micRunning = false
             state.hotkeyError = imAuth == .granted
                 ? error.localizedDescription
                 : "需要「输入监控」权限。请在系统设置中为 VibeBuddy 打开后回到此窗口，会自动启用。"
@@ -217,11 +217,32 @@ final class AudioSourceCoordinator: ObservableObject {
     }
 
     // MARK: hotkey -> AudioStreamer
+    //
+    // Engine lifecycle is bound to the press edge, not the mode. Order
+    // matters:
+    //   • on .start, bring up the engine first; if it fails we don't
+    //     start a session that has no audio source.
+    //   • on .stop / .cancel, drain the streamer first (it flushes the
+    //     last chunk and closes the STT session), then release the
+    //     engine. Tap callbacks already in flight hit `active == false`
+    //     in ingestPCM and get dropped — at most one ~21 ms tap buffer.
 
     private func handleHotkeyPTT(_ event: PTTEvent) {
-        // Mic mode: tailTrimMs = 0 so we don't clip the user's last
-        // syllable when they release the hotkey.
-        ble.audio.handlePTT(event, tailTrimMs: 0)
+        switch event {
+        case .start:
+            do {
+                try mic.start()
+            } catch {
+                state?.hotkeyError = "麦克风启动失败：\(error.localizedDescription)"
+                return
+            }
+            // Mic mode: tailTrimMs = 0 so we don't clip the user's last
+            // syllable when they release the hotkey.
+            ble.audio.handlePTT(event, tailTrimMs: 0)
+        case .stop, .cancel:
+            ble.audio.handlePTT(event, tailTrimMs: 0)
+            mic.stop()
+        }
     }
 
     // MARK: helpers
