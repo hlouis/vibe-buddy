@@ -659,13 +659,16 @@ void loop() {
                   btnAHeld ? 1 : 0,
                   (unsigned)currentBrightness,
                   (unsigned)getCpuFrequencyMhz());
-    bleLogf("mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u cpu=%u",
+    // pm* = which esp_pm locks WE hold. If cpu=240 while pmcpu=0, the
+    // CPU_FREQ_MAX lock is being held by something other than us.
+    bleLogf("mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u cpu=%u pmcpu=%d pmrec=%d pmusb=%d",
             g_mv, g_mvPerMin,
             bleConnected() ? 1 : 0,
             recorderActive() ? 1 : 0,
             btnAHeld ? 1 : 0,
             (unsigned)currentBrightness,
-            (unsigned)getCpuFrequencyMhz());
+            (unsigned)getCpuFrequencyMhz(),
+            cpuLockHeld ? 1 : 0, recSleepHeld ? 1 : 0, usbSleepHeld ? 1 : 0);
   }
 
   if (lastBatteryPoll == 0 || now - lastBatteryPoll >= BATTERY_POLL_MS) {
@@ -790,7 +793,30 @@ void loop() {
   // the old behavior stands, warm for DIM_AFTER_MS after real activity.
   recorderSetMicWarm(bleLinkReady() && currentBrightness == BRIGHT_FULL);
 
-  // Short idle; recorderTick already drains the ring aggressively within
-  // a single call, so we only need to yield briefly.
-  delay(2);
+  // How long we yield here decides whether light sleep can ever happen.
+  //
+  // FreeRTOS tickless idle only sleeps once the idle task has held the
+  // core for CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP — 3 ticks, i.e. 3 ms
+  // at HZ=1000. A flat delay(2) hands it 2 ms and then takes the core
+  // back, so the threshold is never reached and the CPU never sleeps.
+  // Enabling PM bought us nothing until this line changed: the device
+  // still ran warm sitting idle, because our own loop was what kept it
+  // awake.
+  //
+  // (Chasing this was slow because the obvious check is a lie. esp_pm
+  // gives each core an internal CPU_FREQ_MAX lock — "rtos0"/"rtos1" in
+  // pm_impl.c — that is held for as long as anything is runnable on it.
+  // Any getCpuFrequencyMhz() call therefore runs inside a task holding
+  // that lock and always reports the max. Task-side code structurally
+  // cannot observe the idle frequency.)
+  //
+  // 2 ms while there's work — recorderTick drains the ring aggressively
+  // in one call and the audio path wants the tight cadence. 50 ms once
+  // the screen is off and nothing is recording, which clears the sleep
+  // threshold by a wide margin. Buttons are polled, not interrupts, so
+  // this is also their worst-case detection latency: 50 ms is under the
+  // ~100 ms a press feels instant at, and it only applies once the
+  // screen has already gone dark.
+  bool busy = recorderActive() || currentBrightness != BRIGHT_OFF;
+  delay(busy ? 2 : 50);
 }
