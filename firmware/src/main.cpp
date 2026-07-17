@@ -62,6 +62,13 @@ static constexpr uint32_t BATTERY_POLL_MS = 10000;
 static constexpr uint32_t BOLT_BLINK_MS = 500;
 static uint8_t  g_battery = 0;
 static bool     g_charging = false;
+// USB present, read off VBUS rather than inferred from isCharging().
+// isCharging() answers "is the charger IC pushing current right now",
+// which on a full battery oscillates as charge terminates, voltage sags,
+// and the charger kicks back in. That flapping is fine for the bolt icon
+// but useless as a "the user has this thing plugged in" signal — see
+// updateBrightness().
+static bool     g_usbPowered = false;
 static bool     g_boltVisible = false;
 static uint32_t lastBatteryPoll = 0;
 static uint32_t lastBoltToggle = 0;
@@ -71,12 +78,13 @@ static bool     prevCharging = false;
 // Backlight power management. The LCD + backlight is the single largest
 // idle drain on StickS3. We hold full brightness while the user is
 // active, drop to a dim "still readable" level after DIM_AFTER_MS, and
-// fully off after OFF_AFTER_MS. While charging we never dim — the user
-// is plausibly looking at the device for the charge state.
+// fully off after OFF_AFTER_MS. On USB power we never dim — the user is
+// plausibly looking at the device for the charge state, and there's no
+// battery to save.
 //
-// "Activity" = button press, BLE connect/disconnect, recorder start, or
-// any front_app push from the host (the host only pushes on app switch,
-// so this implies the user is at the desk).
+// "Activity" = button press, BLE connect/disconnect, or recorder start.
+// It deliberately does NOT include front_app pushes from the host: see
+// the touchActivity() call site for the measurements that killed that.
 static constexpr uint8_t  BRIGHT_FULL = 180;
 static constexpr uint8_t  BRIGHT_DIM  = 30;
 static constexpr uint8_t  BRIGHT_OFF  = 0;
@@ -95,7 +103,13 @@ static void applyBrightness(uint8_t target) {
 
 static void updateBrightness() {
   uint8_t target;
-  if (g_charging) {
+  // Keyed on USB presence, NOT isCharging(). With a full battery on USB
+  // the charger cycles on and off every few seconds, and this rule used
+  // to follow it: screen strobed full/off, CPU strobed 240/80, and the
+  // ES8311 warmed and tore down on each flip. VBUS is the signal this
+  // rule always meant — "it's plugged in, the user may be looking at the
+  // charge state" — and it doesn't move until the cable does.
+  if (g_usbPowered) {
     target = BRIGHT_FULL;
   } else {
     uint32_t idle = millis() - lastActivityMs;
@@ -588,13 +602,19 @@ void loop() {
     if (lvl > 100) lvl = 100;
     g_battery = (uint8_t)lvl;
     g_charging = M5.Power.isCharging();
+    // VBUS is only exposed on AXP192/AXP2101 boards; StickS3 is AXP2101.
+    // -1 means the model doesn't support it, in which case fall back to
+    // isCharging() and accept the flapping rather than never dimming.
+    int16_t vbus = M5.Power.getVBUSVoltage();
+    g_usbPowered = (vbus < 0) ? g_charging : (vbus > 4000);
     // StickS3 has no fuel gauge — M5Unified estimates SOC linearly from
     // mV (3300→0%, 4100→100%). During Li-Po CV charging, voltage holds
     // near 4.1V for the bulk of the charge, so level can read 100% for
     // a long time. Logging mV lets us tell saturation from a real stall.
     int16_t mv = M5.Power.getBatteryVoltage();
-    Serial.printf("[bat] mv=%d level=%u chg=%d\n",
-                  (int)mv, (unsigned)g_battery, g_charging ? 1 : 0);
+    Serial.printf("[bat] mv=%d level=%u chg=%d vbus=%d usb=%d\n",
+                  (int)mv, (unsigned)g_battery, g_charging ? 1 : 0,
+                  (int)vbus, g_usbPowered ? 1 : 0);
   }
 
   // Bolt blink — local repaint only; full drawScreen() at 2 Hz would
@@ -646,13 +666,29 @@ void loop() {
       ready != prevLinkReady || failed != prevLinkFailed || rec != prevRecording ||
       g_battery != prevBattery || g_charging != prevCharging ||
       strncmp(g_frontApp, prevFrontApp, sizeof(g_frontApp)) != 0) {
-    // Any externally-driven state change counts as user activity — the
-    // host only pushes front_app on a real app switch, BLE link changes
-    // imply someone's plugging things in or moving around, etc. Don't
-    // touch on btnAHeld toggles though — those are already handled by
-    // the press handlers above and would double-touch.
-    if (conn != prevConnected || ready != prevLinkReady || rec != prevRecording ||
-        strncmp(g_frontApp, prevFrontApp, sizeof(g_frontApp)) != 0) {
+    // Link-level changes count as user activity: they're rare, and a
+    // connect really does mean someone just walked up / woke their Mac.
+    //
+    // front_app deliberately does NOT. It used to, on the theory that a
+    // real app switch means the user is at their desk and might glance
+    // over. Measured over 31 minutes of ordinary Mac use, that theory
+    // costs:
+    //
+    //   backlight at full   55.7% of the time
+    //   CPU at 240 MHz      55.7% of the time
+    //   front_app pushes    50, i.e. one every 37 s
+    //
+    // The wake window is 15 s, so anything under a ~15 s switching
+    // cadence pins the screen on permanently. The device spent over half
+    // its life lit and at full clock without anyone touching it — dwarfing
+    // every BLE parameter we were about to tune for power. Switching
+    // windows on the host is host-side state, not someone looking at a
+    // stick in their pocket.
+    //
+    // The name still renders when the screen happens to be on: the outer
+    // condition redraws on any of these, and only the wake timer is
+    // gated here.
+    if (conn != prevConnected || ready != prevLinkReady || rec != prevRecording) {
       touchActivity();
     }
     prevConnected = conn;
@@ -672,8 +708,15 @@ void loop() {
   updateCpuFreq();
   // Pre-warm the mic codec while the user is plausibly about to press
   // BtnA — i.e., screen is at full brightness AND the BLE link is
-  // ready. Removes the ~100 ms cold-start gap from the first chunk of
-  // audio. Released as soon as the screen dims or the link drops.
+  // ready. Removes the ~100 ms cold-start gap, which is 100 ms of speech
+  // that otherwise never gets captured at all.
+  //
+  // Full brightness is a proxy for "user is engaged", and since
+  // updateBrightness() pins FULL on USB, that proxy is permanently true
+  // while plugged in — so the codec stays warm rather than being
+  // released on dim. Deliberate: there's no battery to protect on wall
+  // power, and it buys back the first 100 ms on every press. On battery
+  // the old behavior stands, warm for DIM_AFTER_MS after real activity.
   recorderSetMicWarm(bleLinkReady() && currentBrightness == BRIGHT_FULL);
 
   // Short idle; recorderTick already drains the ring aggressively within
