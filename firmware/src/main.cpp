@@ -52,7 +52,6 @@ static bool     prevConnected = false;
 static uint16_t prevMtu = 0;
 static bool     prevBtnA = false;
 static bool     prevLinkReady = false;
-static bool     prevLinkFailed = false;
 static bool     prevRecording = false;
 
 // Battery is read on a 10 s cadence — getBatteryLevel() goes over I²C to
@@ -293,12 +292,15 @@ static void drawScreen() {
   if (!bleConnected()) {
     M5.Lcd.setTextColor(YELLOW, BLACK);
     M5.Lcd.print("link: advertising");
-  } else if (bleLinkReady()) {
+  } else if (recorderLinkOk()) {
     M5.Lcd.setTextColor(GREEN, BLACK);
     M5.Lcd.printf("link: %s mtu=%u", blePhy(), (unsigned)bleMtu());
-  } else if (bleLinkFailed()) {
+  } else if (bleLinkReady()) {
+    // Connected and settled, but the link can't carry audio. Used to be
+    // "PHY != 2M"; now 1M is fine and MTU is the thing that can actually
+    // be too small, so say that instead of silently refusing to record.
     M5.Lcd.setTextColor(RED, BLACK);
-    M5.Lcd.printf("link: PHY %s (need 2M)", blePhy());
+    M5.Lcd.printf("link: mtu=%u too small", (unsigned)bleMtu());
   } else {
     M5.Lcd.setTextColor(CYAN, BLACK);
     M5.Lcd.print("link: negotiating...");
@@ -654,7 +656,6 @@ void loop() {
   bool conn = bleConnected();
   uint16_t m = bleMtu();
   bool ready = bleLinkReady();
-  bool failed = bleLinkFailed();
   bool rec = recorderActive();
   // Wipe the front-app slot on disconnect so a stale name doesn't sit
   // there suggesting a live link. Reconnect will repopulate via the
@@ -663,7 +664,7 @@ void loop() {
     g_frontApp[0] = 0;
   }
   if (conn != prevConnected || m != prevMtu || btnAHeld != prevBtnA ||
-      ready != prevLinkReady || failed != prevLinkFailed || rec != prevRecording ||
+      ready != prevLinkReady || rec != prevRecording ||
       g_battery != prevBattery || g_charging != prevCharging ||
       strncmp(g_frontApp, prevFrontApp, sizeof(g_frontApp)) != 0) {
     // Link-level changes count as user activity: they're rare, and a
@@ -695,7 +696,6 @@ void loop() {
     prevMtu = m;
     prevBtnA = btnAHeld;
     prevLinkReady = ready;
-    prevLinkFailed = failed;
     prevRecording = rec;
     prevBattery = g_battery;
     prevCharging = g_charging;

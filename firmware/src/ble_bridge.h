@@ -17,13 +17,14 @@ void bleInit(const char* deviceName);
 bool bleConnected();
 uint16_t bleMtu();                 // negotiated ATT MTU, 23 until upgraded
 
-// PHY negotiation state. On every new connection we request 2M PHY both
-// directions; the link isn't considered "ready" for audio until we see
-// the PHY_UPDATE_COMPLETE event. If the peer refuses 2M we fail loudly
-// in phase 1 (no 8kHz fallback) so problems surface rather than hide.
+// PHY negotiation state. We request 2M on every new connection because
+// it halves airtime for free, but losing it is not fatal: on-device Opus
+// needs ~20 kbps and 1M carries that easily. "Ready" therefore means the
+// PHY_UPDATE_COMPLETE event has landed and the link params have settled,
+// whatever PHY we ended up on. What audio actually needs is a big enough
+// MTU — see recorderLinkOk().
 const char* blePhy();              // "1M" | "2M" | "Coded" | "?"
-bool bleLinkReady();                // connected AND 2M PHY negotiated
-bool bleLinkFailed();               // PHY negotiation came back non-2M
+bool bleLinkReady();                // connected AND PHY negotiation settled
 
 size_t bleAvailable();              // bytes waiting in RX ring
 int bleRead();                      // -1 if empty

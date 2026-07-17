@@ -37,6 +37,10 @@ static constexpr size_t OPUS_MAX_PACKET = 256;
 static constexpr size_t OPUS_CBR_PACKET =
     (size_t)OPUS_BITRATE * (size_t)OPUS_FRAME_SAMPLES / (size_t)SAMPLE_RATE / 8;
 
+// Smallest ATT MTU that fits one framed Opus packet in one notify:
+// 6-byte header + payload + the 3 bytes ATT spends on the notify itself.
+static constexpr uint16_t MIN_MTU_FOR_OPUS = 6 + OPUS_CBR_PACKET + 3;
+
 // Ceiling on frames encoded per recorderTick(). The drain condition is
 // "ring has >= one frame", and the mic task on core 1 refills it at one
 // frame per 60 ms — so if encoding were ever slower than realtime, an
@@ -176,9 +180,10 @@ static bool opusBringUp() {
 //
 // The PCM drain loop this replaced derived its payload size from
 // bleMtu() on every tick and so couldn't hit this; that guard was lost
-// with it. It matters because bleLinkReady() gates recording on 2M PHY
-// only — it never checks MTU — and the ATT MTU exchange is not ordered
-// against the PHY update, so a press can land while mtu is still 23.
+// with it. It matters because bleLinkReady() only waits for the PHY
+// negotiation to settle — it never checks MTU — and the ATT MTU exchange
+// is not ordered against the PHY update, so a press can land while mtu
+// is still 23.
 static bool sendOpusFrame(const uint8_t* pkt, size_t len) {
   static uint8_t frame[6 + OPUS_MAX_PACKET];
   uint16_t mtu = bleMtu();
@@ -329,7 +334,7 @@ void recorderInit() {
 void recorderStart() {
   if (active) return;
   if (!bleLinkReady()) {
-    Serial.println("[rec] refused start: BLE link not ready (need 2M PHY)");
+    Serial.println("[rec] refused start: BLE link not ready (PHY not settled)");
     return;
   }
   // bleLinkReady() only vouches for the PHY. The ATT MTU exchange is a
@@ -344,10 +349,9 @@ void recorderStart() {
   // carries our 150-byte frames without trouble. sendOpusFrame still
   // range-checks each frame, so a freak oversized packet is dropped
   // rather than fragmented.
-  const uint16_t minMtu = 6 + OPUS_CBR_PACKET + 3;
-  if (bleMtu() < minMtu) {
+  if (bleMtu() < MIN_MTU_FOR_OPUS) {
     Serial.printf("[rec] refused start: MTU %u < %u needed for %u B frames\n",
-                  (unsigned)bleMtu(), (unsigned)minMtu,
+                  (unsigned)bleMtu(), (unsigned)MIN_MTU_FOR_OPUS,
                   (unsigned)(6 + OPUS_CBR_PACKET));
     return;
   }
@@ -421,6 +425,10 @@ void recorderSetMicWarm(bool warm) {
 }
 
 bool recorderActive()          { return active; }
+
+bool recorderLinkOk() {
+  return bleLinkReady() && bleMtu() >= MIN_MTU_FOR_OPUS;
+}
 uint32_t recorderBytesSent()   { return bytesSent; }
 uint16_t recorderFrameSeq()    { return frameSeq; }
 uint32_t recorderOverruns()    { return overruns; }

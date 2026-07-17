@@ -287,7 +287,8 @@ iOS 端关键标签：`[ble]` / `[stt]` / `[wv]`（WebView 注入）。模拟器
 - **帧分派**：JSON 文本帧以 `\n` 结束；音频二进制帧以魔数 `0xFF 0xAA` 起头，后跟 `seq[2B LE]` + `len[2B LE]` + payload
 - **音频编码**：设备端 Opus（CBR 20kbps，60ms/帧 = 960 样本，VOIP 模式，complexity 1，DTX 关）。一帧 = 一个 Opus 包 = 一个 notify，约 150B + 6B 头，**~2.8 KB/s**（裸 PCM 是 32 KB/s）。主机**全程不解码**：`OggOpusMuxer` 封成 Ogg 直接喂豆包（`format:ogg, codec:opus`）。编解码器在 `{"type":"audio","event":"start",...,"codec":"opus"}` 里声明；**字段缺失 = PCM**，所以旧固件配新 App 仍然能用
 - **链路协商**：连接建立后固件请求 2M PHY + MTU 517（notify payload 上限 500 B）+ DLE 251 + conn interval 7.5–15ms，结果通过 `{"type":"link","phy":"...","mtu":...}` 上报
-- **采样率**：固定 16 kHz，无降级档。2M PHY 是硬性前提——协商不到 2M 时 `recorderStart()` 直接拒绝录音而不是降级，让问题暴露而不是藏起来（见 `ble_bridge.h` 顶部注释）。仍通过 `{"type":"audio","event":"start","sample_rate":N}` 告知 Mac
+- **采样率**：固定 16 kHz，无降级档。通过 `{"type":"audio","event":"start","sample_rate":N,"codec":"opus"}` 告知 Mac
+- **2M PHY 是优化，不是要求**：每次连接都请求 2M（空中时间减半，免费），但拿不到就用 1M——Opus 只要 ~20 kbps，1M 绰绰有余。裸 PCM 时代 2M 是硬性前提（拿不到就拒绝录音），Opus 之后那个硬性要求只剩下「在不支持 2M 的主机上把设备变砖」这一个作用，已去掉。**现在真正制约录音的是 MTU**：一帧 Opus 必须装进一个 notify，所以 `recorderStart()` 检查 `MTU ≥ 159`（6 字节头 + 150 字节 CBR 包 + 3 字节 ATT 开销），不够就拒绝并在屏幕上标红
 - **录音上限**：60 秒硬切（`recorder.cpp` `MAX_RECORD_MS`），防按键卡住烧豆包时长费；触发时走正常 stop 流程，已说的话照常转写
 
 ## 关键设计决策

@@ -24,7 +24,6 @@ static volatile uint16_t  mtu = 23;
 static volatile uint8_t   txPhy = 1;    // 1 = 1M, 2 = 2M, 3 = coded
 static volatile uint8_t   rxPhy = 1;
 static volatile bool      phyEventSeen = false;
-static volatile bool      phyFailed = false;
 static esp_bd_addr_t      peerAddr = {0};
 static volatile bool      peerAddrValid = false;
 
@@ -50,16 +49,16 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer*, esp_ble_gatts_cb_param_t* param) override {
     connected = true;
     phyEventSeen = false;
-    phyFailed = false;
     txPhy = rxPhy = 1;
     memcpy(peerAddr, param->connect.remote_bda, sizeof(esp_bd_addr_t));
     peerAddrValid = true;
     Serial.println("[ble] connected");
 
-    // Ask for 2M both directions. all_phys=0 means 'use the masks'; we set
-    // only the 2M bit, so 1M is effectively forbidden as a preference. The
-    // stack still falls back to 1M if the peer rejects -- we detect that
-    // via PHY_UPDATE_COMPLETE below.
+    // Ask for 2M both directions. all_phys=0 means 'use the masks'; we
+    // set only the 2M bit, so 2M is what we prefer. The stack falls back
+    // to 1M if the peer rejects, which is fine — Opus needs ~20 kbps and
+    // 1M carries that with room to spare. 2M is an airtime optimization
+    // here, not a requirement; see bleLinkReady().
     // Note: IDF API has a typo -- "prefered" (single r). Keeping the misspell.
     esp_err_t r = esp_ble_gap_set_prefered_phy(
       peerAddr,
@@ -97,7 +96,6 @@ class ServerCallbacks : public BLEServerCallbacks {
     mtu = 23;
     txPhy = rxPhy = 1;
     phyEventSeen = false;
-    phyFailed = false;
     peerAddrValid = false;
     Serial.println("[ble] disconnected");
     BLEDevice::startAdvertising();
@@ -132,14 +130,14 @@ static void customGapHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_
       if (p.status == ESP_BT_STATUS_SUCCESS) {
         txPhy = p.tx_phy;
         rxPhy = p.rx_phy;
-        Serial.printf("[ble] phy update: tx=%u rx=%u\n", (unsigned)p.tx_phy, (unsigned)p.rx_phy);
-        if (p.tx_phy != 2 || p.rx_phy != 2) {
-          phyFailed = true;
-          Serial.println("[ble] PHY != 2M on one or both directions -- audio disabled");
-        }
+        Serial.printf("[ble] phy update: tx=%u rx=%u%s\n",
+                      (unsigned)p.tx_phy, (unsigned)p.rx_phy,
+                      (p.tx_phy != 2 || p.rx_phy != 2) ? " (1M is fine for Opus)" : "");
       } else {
-        Serial.printf("[ble] phy update FAILED status=%d\n", (int)p.status);
-        phyFailed = true;
+        // The procedure failing leaves us on whatever we had — 1M. That
+        // carries Opus, so it's a note, not a fault.
+        Serial.printf("[ble] phy update failed status=%d, staying on %s\n",
+                      (int)p.status, blePhy());
       }
       break;
     }
@@ -205,12 +203,20 @@ const char* blePhy() {
   }
 }
 
+// Ready means "the PHY negotiation has settled", not "we won 2M".
+//
+// The 2M requirement made sense when audio was raw 16 kHz PCM at
+// 32 KB/s: 1M genuinely couldn't carry it, so refusing to record was
+// honest. On-device Opus dropped that to ~20 kbps, which 1M carries with
+// room to spare — a 60 ms frame is one 156-byte notify every 60 ms. So
+// the hard fail no longer buys anything and only bricks the device
+// against any central that won't do 2M.
+//
+// We still request 2M on every connection (it halves airtime, which is
+// free), we just no longer treat losing it as fatal. What actually has
+// to hold for audio is MTU, and recorderStart() checks that itself.
 bool bleLinkReady() {
-  return connected && phyEventSeen && !phyFailed && txPhy == 2 && rxPhy == 2;
-}
-
-bool bleLinkFailed() {
-  return connected && phyEventSeen && phyFailed;
+  return connected && phyEventSeen;
 }
 
 size_t bleAvailable() {
