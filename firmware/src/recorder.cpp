@@ -305,12 +305,13 @@ static void recorderTask(void*) {
 }
 
 void recorderInit() {
-  ring = (int16_t*)ps_malloc(RING_SAMPLES * sizeof(int16_t));
+  ring = (int16_t*)malloc(RING_SAMPLES * sizeof(int16_t));
   if (!ring) {
-    Serial.println("[rec] PSRAM alloc failed");
+    Serial.println("[rec] ring alloc failed");
     return;
   }
-  Serial.printf("[rec] ring %u samples allocated in PSRAM\n", (unsigned)RING_SAMPLES);
+  Serial.printf("[rec] ring %u samples (%u B) in internal RAM\n",
+                (unsigned)RING_SAMPLES, (unsigned)(RING_SAMPLES * sizeof(int16_t)));
 
   // Build the encoder now, not on the first press: it's a ~20 KB malloc
   // and the PTT press edge is the one path we care about the latency of.

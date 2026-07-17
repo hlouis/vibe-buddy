@@ -79,7 +79,7 @@ vibe-buddy/
 ## 硬件
 
 **M5Stack StickS3**（SKU K150）
-- ESP32-S3-PICO-1-N8R8（8 MB flash + 8 MB OPI PSRAM）
+- ESP32-S3-PICO-1-N8R8（8 MB flash + 8 MB OPI PSRAM，**PSRAM 我们不启用**——唯一想用它的是 32 KB 音频环形缓冲，而内部 RAM 只用了 17%，装得下它 8 倍；八线 PSRAM 要常供电常时钟，为这点东西开它不划算）
 - 1.14" LCD · MEMS mic 经 ES8311 codec · BMI270 · AXP2101 PMU
 - BLE 5.0（支持 2M PHY + DLE）
 

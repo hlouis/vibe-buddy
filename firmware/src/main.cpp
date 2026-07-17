@@ -482,7 +482,11 @@ void setup() {
   delay(200);
   Serial.println();
   Serial.println("[boot] Vibe Buddy firmware - phase 1 step 4");
-  Serial.printf("[boot] psram free: %u bytes\n", (unsigned)ESP.getFreePsram());
+  // PSRAM is deliberately not initialized — see platformio.ini. The only
+  // thing that ever wanted it was the 32 KB audio ring, which fits in
+  // internal RAM many times over. Report internal heap instead; getting
+  // "psram free: 0" here is the expected, healthy state.
+  Serial.printf("[boot] internal heap free: %u bytes\n", (unsigned)ESP.getFreeHeap());
 
   buildDeviceName();
   Serial.printf("[boot] device name: %s\n", deviceName);

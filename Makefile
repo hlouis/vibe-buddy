@@ -60,6 +60,13 @@ test-ios: gen-ios             ## iOS app unit tests on Simulator (needs: xcodege
 open:                         ## open the umbrella workspace in Xcode
 	open VibeBuddy.xcworkspace
 
+# --- probes ----------------------------------------------------------------
+
+.PHONY: ax-probe
+
+ax-probe:                     ## probe whether AX can atomically set the focused field (ARGS="--detach")
+	swift tools/ax_probe.swift $(ARGS)
+
 # --- firmware --------------------------------------------------------------
 
 .PHONY: fw fw-upload fw-monitor fw-capture
