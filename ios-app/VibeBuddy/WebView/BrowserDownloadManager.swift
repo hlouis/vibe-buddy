@@ -74,9 +74,41 @@ final class BrowserDownloadManager {
     // intercepts a download-intent navigation. We copy the cookies the
     // WebPage has accumulated for this host so authenticated downloads
     // work the same way they would inside the WebView.
+    // Requests we must not rebuild as a plain GET, keyed by URL. Only
+    // non-GET navigations land here: those are the ones where re-issuing
+    // `URLRequest(url:)` would change what the server is being asked for.
+    //
+    // The response-phase hook is the reason this exists at all. It's the
+    // one that catches `Content-Disposition: attachment`, but a
+    // URLResponse carries no method or body — so a POST export (submit
+    // form -> server builds the report -> attachment) would be re-fetched
+    // as a GET, and the 405 or login-page HTML that comes back gets saved
+    // under the attachment's filename. The action phase, which does see
+    // the full request, stashes it here so the response phase can recover
+    // it moments later.
+    private var pendingRequests: [URL: URLRequest] = [:]
+    private static let maxPendingRequests = 8
+
+    func rememberRequest(_ req: URLRequest) {
+        guard let url = req.url,
+              let method = req.httpMethod, method.uppercased() != "GET" else { return }
+        // Bounded: navigations are sequential and we only keep the
+        // non-GET ones, but a page that POSTs in a loop must not grow
+        // this without limit.
+        if pendingRequests.count >= Self.maxPendingRequests {
+            pendingRequests.removeAll()
+        }
+        pendingRequests[url] = req
+    }
+
+    func takeRememberedRequest(for url: URL) -> URLRequest? {
+        pendingRequests.removeValue(forKey: url)
+    }
+
     func start(url: URL,
                suggestedFilename: String?,
-               cookies: [HTTPCookie]) {
+               cookies: [HTTPCookie],
+               originalRequest: URLRequest? = nil) {
         // blob: URLs aren't fetchable by URLSession. Surface a clear
         // error rather than silently failing — at least the user knows
         // *why* it didn't work and can right-click → copy link in
@@ -100,7 +132,11 @@ final class BrowserDownloadManager {
         // configure URLSessionConfiguration.httpCookieStorage with a
         // custom HTTPCookieStorage, but a one-shot header is simpler
         // and avoids polluting any shared cookie jar.
-        var req = URLRequest(url: url)
+        // Start from the navigation's own request when we have one, so a
+        // POST export is re-issued as the same POST with the same body
+        // rather than silently degraded to a GET.
+        var req = originalRequest ?? URLRequest(url: url)
+        req.url = url
         let matched = cookies.filter { Self.cookieMatches(cookie: $0, url: url) }
         if !matched.isEmpty {
             let header = HTTPCookie.requestHeaderFields(with: matched)

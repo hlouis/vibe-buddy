@@ -408,7 +408,11 @@ public final class AudioStreamer {
             bytes: bytes,
             gaps: gaps,
             sampleRate: sampleRate,
-            startedAt: startedAt
+            startedAt: startedAt,
+            // Stamped here rather than computed by the UI: the last emit
+            // of a session is the one that freezes the final duration.
+            durationSec: Date.now.timeIntervalSince(startedAt),
+            codec: codec
         ))
     }
 

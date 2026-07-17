@@ -268,6 +268,48 @@ final class AudioStreamerTests: XCTestCase {
         XCTAssertEqual(pageCount, 4, "headers + audio + EOS page")
     }
 
+    // MARK: session telemetry units
+    //
+    // Regression: `bytes` is raw PCM in mic mode but compressed Opus over
+    // BLE, so anything deriving a duration from it is ~12x short for BLE
+    // sessions. ContentView did exactly that (bytes / (rate*2)) and
+    // reported a 6 s recording as 0.4 s. Duration is now stamped by the
+    // streamer, and `codec` is published so the UI can stop guessing.
+
+    func testSessionPublishesCodecSoConsumersDontGuessTheUnitOfBytes() {
+        startOpus(tailTrimMs: 0)
+        XCTAssertEqual(sessionUpdates.last?.codec, .opus)
+        streamer.handlePTT(.stop)
+
+        streamer.handlePTT(.start(sampleRate: 16000))
+        XCTAssertEqual(sessionUpdates.last?.codec, .pcm)
+    }
+
+    // The dur must come from the clock, not from bytes/(rate*2): 150 B of
+    // Opus is 60 ms of audio, but that arithmetic would call it 4.7 ms.
+    func testSessionDurationIsWallClockNotDerivedFromByteCount() {
+        startOpus(tailTrimMs: 0)
+        streamer.onAudioFrame(seq: 0, payload: opusPacket())
+        let s = sessionUpdates.last
+        XCTAssertEqual(s?.bytes, 150)
+        let bogus = Double(150) / Double(16000 * 2)   // what the UI used to compute
+        XCTAssertNotEqual(s?.durationSec, bogus)
+        XCTAssertGreaterThanOrEqual(s?.durationSec ?? -1, 0)
+    }
+
+    // Once a session ends the reported duration must stop moving —
+    // otherwise a stamped-at-emit value is no better than recomputing
+    // Date.now - startedAt in the view.
+    func testDurationFreezesAfterSessionEnds() async throws {
+        streamer.handlePTT(.start(sampleRate: 16000), tailTrimMs: 0)
+        streamer.ingestPCM(Data(repeating: 0xAB, count: 3200))
+        streamer.handlePTT(.stop)
+        let atEnd = try XCTUnwrap(sessionUpdates.last?.durationSec)
+        try await Task.sleep(nanoseconds: 120_000_000)
+        XCTAssertEqual(sessionUpdates.last?.durationSec, atEnd,
+                       "no further emits, so the final duration must stand")
+    }
+
     // MARK: handleControl JSON dispatch (BLE path)
 
     func testHandleControlStartParsesSampleRate() {

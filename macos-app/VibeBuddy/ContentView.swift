@@ -232,14 +232,16 @@ struct ContentView: View {
                     Text("\(state.totalSessions) done")
                         .font(.caption).foregroundColor(.secondary)
                 }
+                // dur comes from the streamer, not from bytes: `bytes` is
+                // raw PCM in mic mode but compressed Opus over BLE, so
+                // the old bytes/(rate*2) math read ~12x short there.
                 Text(String(
-                    format: "bytes=%d  gaps=%d  rate=%dHz  dur=%.1fs",
-                    s.bytes, s.gaps, s.sampleRate,
-                    Double(s.bytes) / max(Double(s.sampleRate * 2), 1)
+                    format: "bytes=%d (%@)  gaps=%d  rate=%dHz  dur=%.1fs",
+                    s.bytes, s.codec.rawValue, s.gaps, s.sampleRate, s.durationSec
                 ))
                 .font(.system(.caption, design: .monospaced))
                 if let path = state.lastDumpPath, !s.active {
-                    Text("pcm: \(path)")
+                    Text("\(s.codec == .opus ? "ogg" : "pcm"): \(path)")
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundColor(.secondary)
                         .textSelection(.enabled)

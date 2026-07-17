@@ -43,8 +43,16 @@ struct BrowserNavigationDecider: WebPage.NavigationDeciding {
 
     func decidePolicy(for action: WebPage.NavigationAction,
                       preferences: inout WebPage.NavigationPreferences) async -> WKNavigationActionPolicy {
+        // This is the only place the full request is visible. Stash the
+        // non-GET ones so the response phase — which sees a URLResponse
+        // and therefore no method or body — can re-issue faithfully
+        // instead of degrading a POST export into a GET.
+        await manager.rememberRequest(action.request)
+
         if action.shouldPerformDownload {
-            await hijack(url: action.request.url, suggestedFilename: nil)
+            await hijack(url: action.request.url,
+                         suggestedFilename: nil,
+                         request: action.request)
             return .cancel
         }
         return .allow
@@ -65,7 +73,11 @@ struct BrowserNavigationDecider: WebPage.NavigationDeciding {
             let suggested = BrowserDownloadManager
                 .filenameFromContentDisposition(response: response.response)
                 ?? response.response.suggestedFilename
-            await hijack(url: url, suggestedFilename: suggested)
+            // Recover the request the action phase saw, if this
+            // navigation was a POST. nil for ordinary GETs.
+            var original: URLRequest?
+            if let url { original = await manager.takeRememberedRequest(for: url) }
+            await hijack(url: url, suggestedFilename: suggested, request: original)
             return .cancel
         }
         return .allow
@@ -74,11 +86,12 @@ struct BrowserNavigationDecider: WebPage.NavigationDeciding {
     // MARK: - private
 
     @MainActor
-    private func hijack(url: URL?, suggestedFilename: String?) async {
+    private func hijack(url: URL?, suggestedFilename: String?, request: URLRequest?) async {
         guard let url else { return }
         let cookies = await cookieStore.allCookies()
         manager.start(url: url,
                       suggestedFilename: suggestedFilename,
-                      cookies: cookies)
+                      cookies: cookies,
+                      originalRequest: request)
     }
 }
