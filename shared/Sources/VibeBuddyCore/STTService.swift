@@ -90,6 +90,7 @@ public final class STTService: NSObject {
     private var delegate: WSDelegate?
     private var active: Bool = false
     private var sampleRate: Int = 16000
+    private var codec: AudioStreamer.Codec = .pcm
     private var seq: Int32 = 1    // per Go demo: starts at 1, negated for last
     private var closeWatchdog: Task<Void, Never>?
 
@@ -110,7 +111,7 @@ public final class STTService: NSObject {
 
     // MARK: lifecycle
 
-    public func startSession(sampleRate: Int) {
+    public func startSession(sampleRate: Int, codec: AudioStreamer.Codec = .pcm) {
         // Always start clean. A prior session may still be in its close
         // handshake (active=true, socket draining) when the user presses
         // again — silently skipping would feed audio into a dying socket.
@@ -122,6 +123,7 @@ public final class STTService: NSObject {
         }
 
         self.sampleRate = sampleRate
+        self.codec = codec
         self.active = true
         onStatus?(.connecting)
 
@@ -258,13 +260,25 @@ public final class STTService: NSObject {
             "user": [
                 "uid": Self.clientTag
             ],
-            "audio": [
-                "format": "pcm",
-                "codec": "raw",
-                "rate": sampleRate,
-                "bits": 16,
-                "channel": 1
-            ],
+            // Opus arrives already wrapped in an Ogg container by
+            // AudioStreamer; the server decodes it. "rate" stays the
+            // original capture rate in both cases — for Ogg it's what
+            // OpusHead advertises as the input rate, not the 48 kHz the
+            // codec internally resamples to.
+            "audio": codec == .opus
+                ? [
+                    "format": "ogg",
+                    "codec": "opus",
+                    "rate": sampleRate,
+                    "channel": 1
+                  ]
+                : [
+                    "format": "pcm",
+                    "codec": "raw",
+                    "rate": sampleRate,
+                    "bits": 16,
+                    "channel": 1
+                  ],
             "request": [
                 "model_name": "bigmodel",
                 "show_utterances": true,

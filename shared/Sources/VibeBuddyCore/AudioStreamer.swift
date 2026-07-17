@@ -18,6 +18,19 @@ import Foundation
 @MainActor
 public final class AudioStreamer {
 
+    // What the audio source hands us. Session-scoped: the BLE device
+    // announces it in the audio/start control frame, mic mode is always
+    // .pcm (AVAudioEngine has no encoder in this path).
+    //
+    // .opus payloads are never decoded here — we mux them into Ogg and
+    // let Doubao decode. That's the whole point of encoding on-device:
+    // 12x less BLE traffic, and muxing is cheap where decoding wouldn't
+    // be (no libopus on the host, by design).
+    public enum Codec: String, Sendable {
+        case pcm
+        case opus
+    }
+
     // UI + side-effect callbacks. Everything here fires on the main actor.
     public var onSessionUpdate: ((AppState.AudioSession) -> Void)?
     public var onDumpPath: ((String) -> Void)?
@@ -67,6 +80,31 @@ public final class AudioStreamer {
     private var asrChunkBytes: Int { 200 * sampleRate * 2 / 1000 }
     private var asrAccumulator = Data()
 
+    // MARK: Opus session state
+    //
+    // The PCM path trims a trailing byte window; Opus can only trim whole
+    // packets, so the tail is a packet queue instead of a byte buffer.
+    // Everything downstream of the trim converges again: Ogg bytes land
+    // in the same asrAccumulator the PCM path uses, so the warmup gate
+    // and flush-on-arm logic are shared verbatim.
+    private var codec: Codec = .pcm
+    private var oggMuxer = OggOpusMuxer(sampleRate: 16000)
+    private var opusTail: [Data] = []
+
+    // Frame size the firmware encodes at (AUDIO_FRAME_MS in recorder.cpp).
+    // Opus permits 2.5–60 ms; we use the max because fewer, larger BLE
+    // notifies beat more, smaller ones on this link.
+    private static let opusFrameMs: Int = 60
+    private var opusSamplesPerPacket: Int { Self.opusFrameMs * sampleRate / 1000 }
+
+    // How many whole packets the trailing trim window covers. Rounded up
+    // so we never leave part of the release click in: at 60 ms packets a
+    // 200 ms window is 4 packets (240 ms). Coarser than the PCM path's
+    // byte-exact trim, which is inherent to trimming a compressed stream.
+    private var opusTrimPackets: Int {
+        tailTrimMs <= 0 ? 0 : (tailTrimMs + Self.opusFrameMs - 1) / Self.opusFrameMs
+    }
+
     // STT warm-up gate. The firmware starts recording speculatively on
     // BtnA press and sends audio/cancel if it turns out to be a click
     // (< 350 ms). We hold off opening the Doubao WebSocket for 400 ms of
@@ -105,7 +143,14 @@ public final class AudioStreamer {
     public func handleControl(_ line: String) {
         if line.contains("\"event\":\"start\"") {
             let sr = extractInt(from: line, key: "sample_rate") ?? 16000
-            handlePTT(.start(sampleRate: sr), tailTrimMs: AudioStreamer.defaultTailTrimMs)
+            // Absent "codec" means PCM: that's what every firmware before
+            // the Opus change emits, and an old stick must keep working
+            // against a new app.
+            let codec = extractString(from: line, key: "codec")
+                .flatMap { Codec(rawValue: $0) } ?? .pcm
+            handlePTT(.start(sampleRate: sr),
+                      tailTrimMs: AudioStreamer.defaultTailTrimMs,
+                      codec: codec)
         } else if line.contains("\"event\":\"stop\"") {
             handlePTT(.stop)
         } else if line.contains("\"event\":\"cancel\"") {
@@ -119,11 +164,14 @@ public final class AudioStreamer {
     // through here. The tailTrimMs argument is what makes mic mode work
     // without clipping speech: BLE passes 200, mic passes 0.
 
-    public func handlePTT(_ event: PTTEvent, tailTrimMs: Int = AudioStreamer.defaultTailTrimMs) {
+    public func handlePTT(_ event: PTTEvent,
+                          tailTrimMs: Int = AudioStreamer.defaultTailTrimMs,
+                          codec: Codec = .pcm) {
         switch event {
         case .start(let sr):
             self.sampleRate = sr
             self.tailTrimMs = max(0, tailTrimMs)
+            self.codec = codec
             startSession()
         case .stop:
             endSession()
@@ -140,42 +188,79 @@ public final class AudioStreamer {
     // mic input — exactly what we want.
 
     public func ingestPCM(_ pcm: Data) {
-        onAudioFrame(seq: expectedSeq, pcm: pcm)
+        onAudioFrame(seq: expectedSeq, payload: pcm)
     }
 
     // MARK: BLE audio-frame hook
 
-    public func onAudioFrame(seq: UInt16, pcm: Data) {
+    // `payload` is raw PCM or one Opus packet depending on the session's
+    // codec. Mic mode only ever reaches here via ingestPCM.
+    public func onAudioFrame(seq: UInt16, payload: Data) {
         guard active, file != nil else { return }
 
-        var incoming = Data()
-        if seq != expectedSeq {
-            let gap = Int(seq &- expectedSeq)
-            if gap > 0 && gap < 1000 {
-                incoming.append(Data(count: pcm.count * gap))
-                gaps += gap
-                NSLog("[audio] gap: expected=%u got=%u (+%d)", expectedSeq, seq, gap)
-            }
-        }
-        incoming.append(pcm)
+        let gap = detectGap(seq: seq)
         expectedSeq = seq &+ 1
+
+        switch codec {
+        case .pcm:  ingestPCMFrame(payload, gap: gap)
+        case .opus: ingestOpusPacket(payload, gap: gap)
+        }
+        emit()
+    }
+
+    // Returns how many frames were lost before this one. Bounded to
+    // reject the garbage a desync would otherwise turn into a huge
+    // allocation.
+    private func detectGap(seq: UInt16) -> Int {
+        guard seq != expectedSeq else { return 0 }
+        let gap = Int(seq &- expectedSeq)
+        guard gap > 0 && gap < 1000 else { return 0 }
+        gaps += gap
+        NSLog("[audio] gap: expected=%u got=%u (+%d)", expectedSeq, seq, gap)
+        return gap
+    }
+
+    private func ingestPCMFrame(_ pcm: Data, gap: Int) {
+        var incoming = Data()
+        if gap > 0 { incoming.append(Data(count: pcm.count * gap)) }  // pad with silence
+        incoming.append(pcm)
 
         // Back trim: only flush bytes older than the 200 ms trailing window.
         tailBuffer.append(incoming)
         let excess = tailBuffer.count - trimBytes
-        if excess > 0 {
-            let flushed = tailBuffer.prefix(excess)
-            tailBuffer.removeFirst(excess)
-            bytes += excess
-            file?.write(flushed)
-            asrAccumulator.append(flushed)
-            if sttArmed {
-                drainASRChunks()
-            }
-            // When not armed yet, just let asrAccumulator grow. It'll
-            // get drained in one shot when the warmup timer fires.
+        guard excess > 0 else { return }
+        let flushed = tailBuffer.prefix(excess)
+        tailBuffer.removeFirst(excess)
+        bytes += excess
+        emitToSinks(Data(flushed))
+    }
+
+    // Opus can't be gap-padded: there's no "silent packet" we can
+    // synthesize without an encoder, and splicing a wrong-length packet
+    // in would corrupt the stream. We count the gap and move on — the
+    // decoder sees a slightly time-compressed stream, which for ASR
+    // beats a corrupt one. Gaps are rare enough on a 2M link that this
+    // has never been the interesting failure mode.
+    private func ingestOpusPacket(_ packet: Data, gap: Int) {
+        guard !packet.isEmpty else { return }
+        opusTail.append(packet)
+        while opusTail.count > opusTrimPackets {
+            let p = opusTail.removeFirst()
+            bytes += p.count
+            emitToSinks(oggMuxer.append(opusPacket: p))
         }
-        emit()
+    }
+
+    // Shared tail of both codec paths: dump file + ASR accumulator, with
+    // the same warmup gate. Whatever arrives here is already trimmed and
+    // in whatever wire format STT expects for this session.
+    private func emitToSinks(_ data: Data) {
+        guard !data.isEmpty else { return }
+        file?.write(data)
+        asrAccumulator.append(data)
+        // When not armed yet, just let asrAccumulator grow. It'll get
+        // drained in one shot when the warmup timer fires.
+        if sttArmed { drainASRChunks() }
     }
 
     public func cancelSession() {
@@ -190,6 +275,7 @@ public final class AudioStreamer {
             NSLog("[audio] cancelled during warmup — zero network cost")
         }
         tailBuffer.removeAll()
+        opusTail.removeAll()
         asrAccumulator.removeAll()
         closeFile()
         active = false
@@ -204,7 +290,9 @@ public final class AudioStreamer {
         closeFile()
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("VibeBuddy")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let url = dir.appendingPathComponent("out.pcm")
+        // The Opus dump is a real Ogg file — playable by anything, no
+        // ffplay -f s16le incantation needed.
+        let url = dir.appendingPathComponent(codec == .opus ? "out.ogg" : "out.pcm")
         FileManager.default.createFile(atPath: url.path, contents: Data(), attributes: nil)
         self.file = try? FileHandle(forWritingTo: url)
         self.dumpURL = url
@@ -214,6 +302,10 @@ public final class AudioStreamer {
         bytes = 0
         tailBuffer.removeAll(keepingCapacity: true)
         asrAccumulator.removeAll(keepingCapacity: true)
+        opusTail.removeAll(keepingCapacity: true)
+        oggMuxer = OggOpusMuxer(sampleRate: sampleRate,
+                                channels: 1,
+                                samplesPerPacket: opusSamplesPerPacket)
         startedAt = .now
         active = true
         sttArmed = false
@@ -229,9 +321,9 @@ public final class AudioStreamer {
             await MainActor.run { self?.armSTT() }
         }
 
-        NSLog("[audio] session -> %@ (rate=%d tailTrim=%dms warmup=%dms asrChunk=%dB)",
-              url.path, sampleRate, tailTrimMs,
-              AudioStreamer.sttWarmupMs, asrChunkBytes)
+        NSLog("[audio] session -> %@ (codec=%@ rate=%d tailTrim=%dms warmup=%dms)",
+              url.path, codec.rawValue, sampleRate, tailTrimMs,
+              AudioStreamer.sttWarmupMs)
         onDumpPath?(url.path)
         emit()
     }
@@ -240,8 +332,18 @@ public final class AudioStreamer {
         guard active else { return }
         sttWarmupTask?.cancel()
         sttWarmupTask = nil
-        let droppedTail = tailBuffer.count
+        // Whatever's still held back by the trim window is the release
+        // click — dropping it is the entire point.
+        let droppedTail = codec == .opus ? opusTail.count : tailBuffer.count
         tailBuffer.removeAll()
+        opusTail.removeAll()
+        // Close the Ogg stream so the dump is a valid file and the server
+        // sees a proper EOS. Must happen before the final flush below.
+        if codec == .opus {
+            let eos = oggMuxer.finish()
+            file?.write(eos)
+            asrAccumulator.append(eos)
+        }
         closeFile()
 
         if sttArmed {
@@ -273,15 +375,25 @@ public final class AudioStreamer {
         sttArmed = true
         NSLog("[audio] STT warmup elapsed — arming session, flushing %d pre-buffered bytes",
               asrAccumulator.count)
-        stt.startSession(sampleRate: sampleRate)
+        stt.startSession(sampleRate: sampleRate, codec: codec)
         drainASRChunks()
     }
 
+    // PCM is re-chunked to Doubao's 200 ms sweet spot. Ogg is not: its
+    // pages are already framed, and re-cutting them at arbitrary byte
+    // offsets would just hand the server torn pages. Push what we have.
     private func drainASRChunks() {
-        while asrAccumulator.count >= asrChunkBytes {
-            let chunk = Data(asrAccumulator.prefix(asrChunkBytes))
-            asrAccumulator.removeFirst(asrChunkBytes)
-            stt.pushAudio(chunk)
+        switch codec {
+        case .opus:
+            guard !asrAccumulator.isEmpty else { return }
+            stt.pushAudio(asrAccumulator)
+            asrAccumulator.removeAll(keepingCapacity: true)
+        case .pcm:
+            while asrAccumulator.count >= asrChunkBytes {
+                let chunk = Data(asrAccumulator.prefix(asrChunkBytes))
+                asrAccumulator.removeFirst(asrChunkBytes)
+                stt.pushAudio(chunk)
+            }
         }
     }
 
@@ -301,6 +413,13 @@ public final class AudioStreamer {
     }
 
     private func emitDone() { onSessionEnded?() }
+
+    private func extractString(from line: String, key: String) -> String? {
+        guard let range = line.range(of: "\"\(key)\":\"") else { return nil }
+        let rest = line[range.upperBound...]
+        guard let end = rest.firstIndex(of: "\"") else { return nil }
+        return String(rest[..<end])
+    }
 
     private func extractInt(from line: String, key: String) -> Int? {
         guard let range = line.range(of: "\"\(key)\":") else { return nil }

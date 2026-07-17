@@ -5,12 +5,29 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <string.h>
+#include <opus.h>
 
-// 16 kHz mono 16-bit -> 32 KB/s. Ring holds ~500 ms so the BLE drain can
-// breathe through a short stall without dropping samples.
+// Mic captures 16 kHz mono 16-bit (32 KB/s of PCM); we Opus-encode it to
+// ~2.8 KB/s before it ever touches the radio. The ring still holds raw
+// PCM — encoding happens at drain time in recorderTick — and buys ~500 ms
+// of slack so the BLE drain can breathe through a short stall.
 static constexpr uint32_t SAMPLE_RATE = 16000;
 static constexpr size_t RING_SAMPLES = 16384;   // 32 KB @ int16
 static constexpr size_t CHUNK_SAMPLES = 512;    // 32 ms per mic read
+
+// Opus. 60 ms is the largest frame Opus allows, and we want the largest:
+// it minimizes notifies/sec and header overhead on a link where those,
+// not raw throughput, are the scarce resource. 960 samples @ 16 kHz.
+//
+// CBR 20 kbps -> ~150 B/packet, comfortably inside one notify. Complexity
+// 1 keeps the encoder off the critical path (this runs in recorderTick on
+// the main loop). DTX stays OFF: it would let the encoder skip silent
+// frames, but the host's Ogg muxer advances granule per delivered packet,
+// so silently-dropped frames would desync the timeline. Not worth it for
+// a push-to-talk device that only transmits while a button is held.
+static constexpr int OPUS_FRAME_SAMPLES = 960;
+static constexpr int OPUS_BITRATE = 20000;
+static constexpr size_t OPUS_MAX_PACKET = 256;
 
 // Hard cap on a single session. A physically stuck BtnA (or one wedged
 // by a wet finger / case pressure) otherwise records forever: the mic
@@ -48,6 +65,22 @@ static volatile uint32_t startedAt = 0;
 static volatile bool micUp = false;
 static volatile bool micShutdownPending = false;
 
+// Opus encoder. Created once at init and reset per session rather than
+// created/destroyed per press: opus_encoder_create for 16 kHz mono is a
+// ~20 KB allocation, and doing that on the PTT press edge would add
+// latency to the exact path we spent effort making fast. Unlike the
+// ES8311 it costs no analog power to leave instantiated.
+static OpusEncoder* opusEnc = nullptr;
+
+// One encoded packet awaiting a retry. opus_encode is stateful, so the
+// PCM path's "leave the samples in the ring and re-send next tick" trick
+// is not available to us: by then the encoder has advanced past this
+// frame and re-encoding the same PCM would splice a frame encoded
+// against the wrong state into the stream. So we consume the PCM once,
+// and park the *encoded* packet here if the link pushes back.
+static uint8_t pendingPkt[OPUS_MAX_PACKET];
+static size_t  pendingLen = 0;
+
 static bool micBringUp() {
   if (micUp) return true;
   auto mcfg = M5.Mic.config();
@@ -66,6 +99,43 @@ static bool micBringUp() {
 
 static inline size_t ringAvail() {
   return (ringHead + RING_SAMPLES - ringTail) % RING_SAMPLES;
+}
+
+static bool opusBringUp() {
+  if (opusEnc) return true;
+  int err = OPUS_OK;
+  opusEnc = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, &err);
+  if (!opusEnc || err != OPUS_OK) {
+    Serial.printf("[rec] opus_encoder_create failed: %d\n", err);
+    opusEnc = nullptr;
+    return false;
+  }
+  opus_encoder_ctl(opusEnc, OPUS_SET_VBR(0));                    // CBR: predictable packet size
+  opus_encoder_ctl(opusEnc, OPUS_SET_BITRATE(OPUS_BITRATE));
+  opus_encoder_ctl(opusEnc, OPUS_SET_DTX(0));                    // see comment on OPUS_FRAME_SAMPLES
+  opus_encoder_ctl(opusEnc, OPUS_SET_COMPLEXITY(1));
+  opus_encoder_ctl(opusEnc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+  Serial.printf("[rec] opus encoder up: %u Hz mono CBR %d bps, %d ms frames\n",
+                (unsigned)SAMPLE_RATE, OPUS_BITRATE,
+                OPUS_FRAME_SAMPLES * 1000 / (int)SAMPLE_RATE);
+  return true;
+}
+
+// Frame and ship one Opus packet. Returns false if the link pushed back,
+// in which case the caller must park the packet — it cannot be rebuilt.
+static bool sendOpusFrame(const uint8_t* pkt, size_t len) {
+  static uint8_t frame[6 + OPUS_MAX_PACKET];
+  frame[0] = 0xFF;
+  frame[1] = 0xAA;
+  frame[2] = (uint8_t)(frameSeq & 0xFF);
+  frame[3] = (uint8_t)((frameSeq >> 8) & 0xFF);
+  frame[4] = (uint8_t)(len & 0xFF);
+  frame[5] = (uint8_t)((len >> 8) & 0xFF);
+  memcpy(frame + 6, pkt, len);
+  if (bleWrite(frame, 6 + len) == 0) return false;
+  frameSeq++;
+  bytesSent += len;
+  return true;
 }
 
 static void recorderTask(void*) {
@@ -152,6 +222,13 @@ void recorderInit() {
   }
   Serial.printf("[rec] ring %u samples allocated in PSRAM\n", (unsigned)RING_SAMPLES);
 
+  // Build the encoder now, not on the first press: it's a ~20 KB malloc
+  // and the PTT press edge is the one path we care about the latency of.
+  // Unlike the ES8311 it draws no analog power sitting idle, so there's
+  // nothing to gain by deferring it. recorderStart() re-checks and only
+  // resets state.
+  opusBringUp();
+
   // ES8311 / I2S start-up is deferred to recorderStart(). Keeping the
   // codec powered through long idle periods was a measurable share of
   // baseline current draw; we accept the ~50 ms warm-up cost on the
@@ -176,20 +253,32 @@ void recorderStart() {
     Serial.println("[rec] start aborted: codec failed to come up");
     return;
   }
+  if (!opusBringUp()) {
+    Serial.println("[rec] start aborted: opus encoder unavailable");
+    micShutdownPending = true;
+    return;
+  }
+  // Fresh encoder state per session — otherwise the first packets of a
+  // new press are predicted against the tail of the previous one.
+  opus_encoder_ctl(opusEnc, OPUS_RESET_STATE);
   ringHead = ringTail = 0;
   frameSeq = 0;
   bytesSent = 0;
   overruns = 0;
+  pendingLen = 0;
   stopPending = false;
   startedAt = millis();
   active = true;
 
-  char buf[80];
+  // "codec" is new as of the on-device Opus change. Hosts that predate
+  // it ignore the key and assume PCM — which is why the field is
+  // additive rather than a version bump.
+  char buf[96];
   int n = snprintf(buf, sizeof(buf),
-                   "{\"type\":\"audio\",\"event\":\"start\",\"sample_rate\":%u}\n",
+                   "{\"type\":\"audio\",\"event\":\"start\",\"sample_rate\":%u,\"codec\":\"opus\"}\n",
                    (unsigned)SAMPLE_RATE);
   bleWrite((const uint8_t*)buf, (size_t)n);
-  Serial.printf("[rec] start @ %u Hz\n", (unsigned)SAMPLE_RATE);
+  Serial.printf("[rec] start @ %u Hz opus\n", (unsigned)SAMPLE_RATE);
 }
 
 void recorderStop() {
@@ -209,6 +298,7 @@ void recorderCancel() {
   active = false;
   stopPending = false;
   ringHead = ringTail = 0;
+  pendingLen = 0;
   micShutdownPending = true;   // task will end() the codec on its idle pass
   const char* s = "{\"type\":\"audio\",\"event\":\"cancel\"}\n";
   bleWrite((const uint8_t*)s, strlen(s));
@@ -247,51 +337,44 @@ void recorderTick() {
     recorderStop();
   }
 
-  // Derive max PCM payload from the live MTU. Frame header = 6 bytes, and
-  // ble_bridge internally caps notify payload at 244. Keep payload even
-  // so we never split a 16-bit sample across frames.
-  uint16_t mtu = bleMtu();
-  size_t notifyCap = mtu > 3 ? (size_t)(mtu - 3) : 20;
-  if (notifyCap > 500) notifyCap = 500;
-  size_t maxPayload = notifyCap > 6 ? notifyCap - 6 : 14;
-  maxPayload &= ~size_t(1);
-
-  static uint8_t frame[512];    // header + up to ~494 bytes payload
-
-  while (true) {
-    size_t avail = ringAvail();
-    if (avail == 0) break;
-
-    size_t samples = avail;
-    size_t payloadBytes = samples * 2;
-    if (payloadBytes > maxPayload) payloadBytes = maxPayload;
-    size_t sendSamples = payloadBytes / 2;
-
-    frame[0] = 0xFF;
-    frame[1] = 0xAA;
-    frame[2] = (uint8_t)(frameSeq & 0xFF);
-    frame[3] = (uint8_t)((frameSeq >> 8) & 0xFF);
-    frame[4] = (uint8_t)(payloadBytes & 0xFF);
-    frame[5] = (uint8_t)((payloadBytes >> 8) & 0xFF);
-
-    // Copy samples out of the ring, little-endian on-wire.
-    for (size_t i = 0; i < sendSamples; i++) {
-      int16_t s = ring[(ringTail + i) % RING_SAMPLES];
-      frame[6 + i * 2]     = (uint8_t)(s & 0xFF);
-      frame[6 + i * 2 + 1] = (uint8_t)((s >> 8) & 0xFF);
-    }
-
-    size_t wrote = bleWrite(frame, 6 + payloadBytes);
-    if (wrote == 0) {
-      // Not connected or write failed; leave samples for next tick.
-      break;
-    }
-    ringTail = (ringTail + sendSamples) % RING_SAMPLES;
-    frameSeq++;
-    bytesSent += payloadBytes;
+  // Retry a parked packet before encoding anything new — otherwise we'd
+  // emit frames out of order.
+  if (pendingLen > 0) {
+    if (!sendOpusFrame(pendingPkt, pendingLen)) return;   // link still stuck
+    pendingLen = 0;
   }
 
-  if (stopPending && !active && ringAvail() == 0) {
+  static int16_t encBuf[OPUS_FRAME_SAMPLES];
+  static uint8_t pkt[OPUS_MAX_PACKET];
+
+  // Encode whole 60 ms frames only. Opus has no partial-frame concept:
+  // a short tail would have to be zero-padded, and since the host trims
+  // the trailing window anyway (release click), padding it would be
+  // fabricating audio nobody will ever hear. Leftovers < 960 samples are
+  // dropped at stop.
+  while (opusEnc && ringAvail() >= (size_t)OPUS_FRAME_SAMPLES) {
+    for (int i = 0; i < OPUS_FRAME_SAMPLES; i++) {
+      encBuf[i] = ring[(ringTail + i) % RING_SAMPLES];
+    }
+    // Consume the PCM up front: the encoder state has moved on, so
+    // these samples can never be re-encoded into an equivalent packet.
+    ringTail = (ringTail + OPUS_FRAME_SAMPLES) % RING_SAMPLES;
+
+    int n = opus_encode(opusEnc, encBuf, OPUS_FRAME_SAMPLES, pkt, sizeof(pkt));
+    if (n < 0) {
+      Serial.printf("[rec] opus_encode failed: %d\n", n);
+      continue;
+    }
+    if (n <= 2) continue;   // DTX/comfort-noise stub; we run with DTX off
+
+    if (!sendOpusFrame(pkt, (size_t)n)) {
+      memcpy(pendingPkt, pkt, (size_t)n);
+      pendingLen = (size_t)n;
+      return;
+    }
+  }
+
+  if (stopPending && !active && ringAvail() < (size_t)OPUS_FRAME_SAMPLES && pendingLen == 0) {
     stopPending = false;
     const char* s = "{\"type\":\"audio\",\"event\":\"stop\"}\n";
     bleWrite((const uint8_t*)s, strlen(s));

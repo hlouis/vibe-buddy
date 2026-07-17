@@ -334,8 +334,11 @@ extension BLEController: CBPeripheralDelegate {
             NSLog("[ble] truncated audio frame: header=%d got=%d", len, data.count - 6)
             return
         }
-        let pcm = data.subdata(in: 6 ..< (6 + len))
-        audio.onAudioFrame(seq: seq, pcm: pcm)
+        // Payload is PCM or one Opus packet — the frame header is codec
+        // agnostic, and AudioStreamer already knows which from the
+        // audio/start control frame.
+        let payload = data.subdata(in: 6 ..< (6 + len))
+        audio.onAudioFrame(seq: seq, payload: payload)
     }
 
     private func handleJSONBytes(_ data: Data) {

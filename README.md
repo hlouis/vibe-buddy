@@ -222,15 +222,19 @@ make test-ios       # 只跑 iOS App 端（TextRouter / PasteboardHandler / Text
 
 ### 纯 BLE 验证（不走豆包）
 
-用 Python 脚本直接抓 BLE 音频流落 PCM，绕开 Mac App 和 ASR：
+用 Python 脚本直接抓 BLE 音频流落盘，绕开 Mac App 和 ASR：
 
 ```bash
 python3 -m venv tools/.venv
 tools/.venv/bin/pip install bleak
 tools/.venv/bin/python tools/ble_audio_dump.py
-# 按住 A 录一段，松开后：
-ffmpeg -y -f s16le -ar 16000 -ac 1 -i out.pcm out.wav && afplay out.wav
+# 按住 A 录一段，松开后（固件现在发 Opus，脚本自动封成 Ogg）：
+afplay out.ogg
 ```
+
+脚本按固件在 `audio/start` 里声明的 `codec` 走：`opus` → 封 Ogg 落 `out.ogg`（直接可播）；无 `codec` 字段（Opus 之前的旧固件）→ 裸 PCM 落 `out.pcm`。
+
+脚本里的 Ogg muxer 是 `OggOpusMuxer.swift` 的逐行移植——**改一个必须改另一个**，否则这个工具会「证明」App 里并不存在的 bug。`make test-ogg` 就是拿真 Opus 包过一遍我们的 muxer 再让 ffmpeg 解码，验证两边都没跑偏。
 
 ### 固件日志
 
@@ -259,7 +263,8 @@ iOS 端关键标签：`[ble]` / `[stt]` / `[wv]`（WebView 注入）。模拟器
 - **BLE 服务**：复用 Nordic UART Service（NUS），UUID `6E400001-...`，与 [claude-desktop-buddy](https://github.com/imliubo/claude-desktop-buddy/tree/feat/migrate-to-m5unified) 协议兼容
 - **广播名**：`VibeBuddy-XXXX`（XXXX = BT MAC 后 4 位十六进制）
 - **设备配对**：应用层白名单，不是 BLE bonding（链路仍是明文，加密见 Phase 2）。白名单存 `XXXX` 后缀——它源自 BT MAC，跨主机稳定，跟机身屏幕上显示的一致。macOS 存 `~/.config/vibe-buddy/devices.json`，iOS 存 `UserDefaults`。**白名单为空 = 连第一个搜索到的设备**（保持老行为，升级不会断连）；非空则只连白名单内的。配对界面在 macOS `设置 → 设备` / iOS `设置 → 蓝牙设备`
-- **帧分派**：JSON 文本帧以 `\n` 结束；音频二进制帧以魔数 `0xFF 0xAA` 起头，后跟 `seq[2B LE]` + `len[2B LE]` + PCM
+- **帧分派**：JSON 文本帧以 `\n` 结束；音频二进制帧以魔数 `0xFF 0xAA` 起头，后跟 `seq[2B LE]` + `len[2B LE]` + payload
+- **音频编码**：设备端 Opus（CBR 20kbps，60ms/帧 = 960 样本，VOIP 模式，complexity 1，DTX 关）。一帧 = 一个 Opus 包 = 一个 notify，约 150B + 6B 头，**~2.8 KB/s**（裸 PCM 是 32 KB/s）。主机**全程不解码**：`OggOpusMuxer` 封成 Ogg 直接喂豆包（`format:ogg, codec:opus`）。编解码器在 `{"type":"audio","event":"start",...,"codec":"opus"}` 里声明；**字段缺失 = PCM**，所以旧固件配新 App 仍然能用
 - **链路协商**：连接建立后固件请求 2M PHY + MTU 517（notify payload 上限 500 B）+ DLE 251 + conn interval 7.5–15ms，结果通过 `{"type":"link","phy":"...","mtu":...}` 上报
 - **采样率**：固定 16 kHz，无降级档。2M PHY 是硬性前提——协商不到 2M 时 `recorderStart()` 直接拒绝录音而不是降级，让问题暴露而不是藏起来（见 `ble_bridge.h` 顶部注释）。仍通过 `{"type":"audio","event":"start","sample_rate":N}` 告知 Mac
 - **录音上限**：60 秒硬切（`recorder.cpp` `MAX_RECORD_MS`），防按键卡住烧豆包时长费；触发时走正常 stop 流程，已说的话照常转写

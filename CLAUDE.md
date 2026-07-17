@@ -43,12 +43,19 @@ cd ios-app && xcodebuild -project VibeBuddy-iOS.xcodeproj -scheme VibeBuddy-iOS 
 ```
 firmware/ (C++/PlatformIO)        shared/Sources/VibeBuddyCore (Swift Package)         macos-app/ + ios-app/
 ─────────────────────────         ──────────────────────────────────────────         ──────────────────────
-StickS3 → BLE NUS notify  ──┐                                                          ┌── macOS: TextInjector (CGEvent)
+StickS3 → Opus → BLE NUS  ──┐                                                          ┌── macOS: TextInjector (CGEvent)
                             │     PTTTrigger ──► PTTSession ──► AudioStreamer          │
-本机麦克风 (AVFoundation) ──┼──► (按键事件)     (会话状态机)   (200ms chunk)  ──► STTService ──► AppState ──► TextHandler
+本机麦克风 (AVFoundation) ──┼──► (按键事件)     (会话状态机)   (按 codec 分流) ──► STTService ──► AppState ──► TextHandler
                             │                                  └► MicCaptureController                       │
                             │                                                                                ├── iOS 转写 tab: PasteboardHandler
                             └──► BLEController (CoreBluetooth Central)                                       └── iOS 浏览器 tab: WebViewInjector (JS diff)
+```
+
+音频有两条 codec 路径，在 `AudioStreamer` 里汇合：
+
+```
+BLE   → Opus 包 → 按整包 trim → OggOpusMuxer → STT(ogg/opus)   ← 主机不解码
+麦克风 → PCM   → 按字节 trim  → 200ms 分块   → STT(pcm/raw)
 ```
 
 ### `shared/Sources/VibeBuddyCore` 是单一事实源
@@ -58,8 +65,9 @@ StickS3 → BLE NUS notify  ──┐                                           
 - **`PTTTrigger.swift`**：协议，把"按下/松开"事件抽象掉。两个具体实现分别在 `macos-app/HotKeyPTTTrigger.swift`（全局热键）和 `ios-app/ButtonPTTTrigger.swift`（屏幕按键）。
 - **`PTTSession.swift`**：会话状态机，串起 trigger → 音源 → STT。所有"按下时启 / 松开时停"的协调点都在这里。
 - **`MicCaptureController.swift`**：本机麦克风采集（AVAudioEngine）。**生命周期必须严格绑到 PTT 事件**——按下才 start，松开就 stop & 释放——否则系统状态栏麦克风指示灯会一直亮。两端 App 通过 `AudioSourceCoordinator.swift` 在 BLE 音源 / 本机麦音源之间切换。
-- **`BLEController.swift`**：CoreBluetooth Central，按 NUS 协议跑帧分派。文本帧 `\n` 结束、二进制帧魔数 `0xFF 0xAA` 起头（详见 README "BLE 协议要点"）。
-- **`AudioStreamer.swift`**：把零碎 PCM 切成 200ms chunk，喂给 STTService。
+- **`BLEController.swift`**：CoreBluetooth Central，按 NUS 协议跑帧分派。文本帧 `\n` 结束、二进制帧魔数 `0xFF 0xAA` 起头（详见 README "BLE 协议要点"）。同时管设备配对白名单（`PairedDeviceStore`）——**白名单为空 = 连第一个看见的**，这是为了不破坏老安装。
+- **`AudioStreamer.swift`**：按 session codec 分流。PCM（麦克风）切 200ms chunk；Opus（BLE）按整包 trim 后交给 `OggOpusMuxer`。**Opus 永不解码**——主机没有也不需要 libopus。
+- **`OggOpusMuxer.swift`**：把裸 Opus 包封成 Ogg（RFC 7845），一包一页。改这里必须同步改 `tools/ble_audio_dump.py` 里的移植版，并跑 `make test-ogg`（拿真 Opus 包过 muxer 再让 ffmpeg 解码）。单测只能验证我们自己的假设——EOS 页曾经因为多写了一个零长 lacing segment 而被 ffmpeg 拒收，而所有单测都是绿的。
 - **`STTService.swift`**：豆包流式 ASR 的二进制协议 + WebSocket。鉴权 header 是 `X-Api-Request-Id`（不是文档里的 `X-Api-Connect-Id`），最后一帧用**负数** seq + flag `0x3`。
 - **`AppState.swift`**：`@MainActor ObservableObject`，UI 绑这个。
 - **`TextHandler.swift`**：跨平台文字落点协议；macOS 实现是 `TextInjector`（CGEvent），iOS 实现是 `TextRouter`（在 `PasteboardHandler` ↔ `WebViewInjector` 间路由）。
@@ -88,7 +96,8 @@ CGEvent + 最长公共前缀 diff，按 partial 增量打字。`FocusGate.swift`
 
 ## 调试工具
 
-- **纯 BLE 验证（不走豆包）**：`tools/ble_audio_dump.py`（bleak 客户端）抓 PCM 落盘，绕开 App + ASR。详见 README "调试工具"。
+- **纯 BLE 验证（不走豆包）**：`tools/ble_audio_dump.py`（bleak 客户端）抓音频落盘，绕开 App + ASR。固件发 Opus 时自动封成可直接播放的 `out.ogg`。详见 README "调试工具"。
+- **Ogg 封装验证**：`make test-ogg` —— 真 Opus 包 → 我们的 muxer → ffmpeg 解码 → 检查音调还在。
 - **macOS 日志**：`log stream --predicate 'process == "VibeBuddy"' --style compact`，关键标签 `[ble] [json] [audio] [stt]`。
 - **iOS 日志**：模拟器在 Xcode console 看，真机用 Console.app 按 `VibeBuddy` 过滤。关键标签 `[ble] [stt] [wv]`。
 - **固件日志**：`make fw-monitor`，标签 `[boot] [ble] [link] [rec] [mic] [tick] [rec-tick]`。

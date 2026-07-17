@@ -39,12 +39,15 @@ build-ios: gen-ios            ## build the iOS app for Simulator (needs: xcodege
 
 # --- tests -----------------------------------------------------------------
 
-.PHONY: test test-shared test-ios
+.PHONY: test test-shared test-ios test-ogg
 
-test: test-shared test-ios    ## run all unit tests (needs: xcodegen, xcbeautify)
+test: test-shared test-ogg test-ios    ## run all unit tests (needs: xcodegen, xcbeautify)
 
 test-shared:                  ## SwiftPM tests for VibeBuddyCore (no extra deps)
 	cd shared && swift test
+
+test-ogg:                     ## verify Ogg muxing against a real decoder (needs: ffmpeg)
+	python3 tools/verify_ogg_mux.py
 
 test-ios: gen-ios             ## iOS app unit tests on Simulator (needs: xcodegen, xcbeautify)
 	cd ios-app && xcodebuild -project VibeBuddy-iOS.xcodeproj \

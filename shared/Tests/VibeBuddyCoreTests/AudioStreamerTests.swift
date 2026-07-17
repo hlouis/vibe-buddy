@@ -186,6 +186,88 @@ final class AudioStreamerTests: XCTestCase {
                        "must flush only the bytes older than the 200 ms trailing window")
     }
 
+    // MARK: Opus path
+    //
+    // The firmware encodes on-device and we never decode: packets get
+    // muxed into Ogg and handed to Doubao as-is. That forks trim (whole
+    // packets, not bytes) and framing (Ogg pages, not 200 ms chunks),
+    // so both need pinning. `bytes` counts raw Opus payload accepted,
+    // which is what makes the packet-level trim observable from here.
+
+    private func opusPacket(_ n: Int = 150) -> Data { Data(repeating: 0xAB, count: n) }
+
+    private func startOpus(tailTrimMs: Int = AudioStreamer.defaultTailTrimMs) {
+        streamer.handlePTT(.start(sampleRate: 16000), tailTrimMs: tailTrimMs, codec: .opus)
+    }
+
+    // 200 ms of trim at 60 ms packets rounds UP to 4 — a partial packet
+    // can't be trimmed, and leaving click audio in is worse than losing
+    // 40 ms of silence.
+    func testOpusTrimHoldsBackFourPackets() {
+        startOpus()
+        for i in 0..<4 { streamer.onAudioFrame(seq: UInt16(i), payload: opusPacket()) }
+        XCTAssertEqual(sessionUpdates.last?.bytes, 0,
+                       "first 4 packets are the trim window and must not flush")
+    }
+
+    func testOpusTrimFlushesOnlyPacketsOlderThanWindow() {
+        startOpus()
+        for i in 0..<6 { streamer.onAudioFrame(seq: UInt16(i), payload: opusPacket()) }
+        XCTAssertEqual(sessionUpdates.last?.bytes, 300,
+                       "6 packets in, 4 held back, 2 * 150 B flushed")
+    }
+
+    func testOpusTrimZeroFlushesEveryPacket() {
+        startOpus(tailTrimMs: 0)
+        streamer.onAudioFrame(seq: 0, payload: opusPacket())
+        XCTAssertEqual(sessionUpdates.last?.bytes, 150,
+                       "tailTrimMs=0 must not hold any packet back")
+    }
+
+    func testOpusEmptyPacketIsIgnored() {
+        startOpus(tailTrimMs: 0)
+        streamer.onAudioFrame(seq: 0, payload: Data())
+        XCTAssertEqual(sessionUpdates.last?.bytes, 0)
+    }
+
+    func testOpusPacketsDroppedWhenInactive() {
+        streamer.onAudioFrame(seq: 0, payload: opusPacket())
+        XCTAssertTrue(sessionUpdates.isEmpty)
+    }
+
+    // The dump is a real Ogg file, not raw PCM — worth keeping true, it's
+    // the difference between "double-click to play" and an ffplay
+    // incantation with the right -f/-ar/-ac flags.
+    func testOpusSessionDumpsToOggFile() {
+        startOpus()
+        XCTAssertEqual(dumpPaths.last?.hasSuffix("out.ogg"), true)
+    }
+
+    func testPCMSessionStillDumpsToPCMFile() {
+        streamer.handlePTT(.start(sampleRate: 16000))
+        XCTAssertEqual(dumpPaths.last?.hasSuffix("out.pcm"), true)
+    }
+
+    // Ending inside the warmup window never arms STT, so this only pins
+    // that the muxer's EOS page reaches the dump — without it the file
+    // is truncated and strict demuxers reject it.
+    func testOpusEndSessionWritesOggStreamToDump() throws {
+        startOpus(tailTrimMs: 0)
+        streamer.onAudioFrame(seq: 0, payload: opusPacket())
+        streamer.handlePTT(.stop)
+
+        let path = try XCTUnwrap(dumpPaths.last)
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        XCTAssertEqual(Array(data.prefix(4)), Array("OggS".utf8),
+                       "dump must be a real Ogg stream")
+        // OpusHead + OpusTags + audio + EOS = 4 pages.
+        var pageCount = 0
+        for i in 0..<(data.count - 3) where Array(data[i..<i+4]) == Array("OggS".utf8) {
+            pageCount += 1
+        }
+        XCTAssertEqual(pageCount, 4, "headers + audio + EOS page")
+    }
+
     // MARK: handleControl JSON dispatch (BLE path)
 
     func testHandleControlStartParsesSampleRate() {
@@ -197,6 +279,30 @@ final class AudioStreamerTests: XCTestCase {
     func testHandleControlStartDefaultsTo16kHz() {
         streamer.handleControl("{\"type\":\"audio\",\"event\":\"start\"}")
         XCTAssertEqual(sessionUpdates.last?.sampleRate, 16000)
+    }
+
+    // Codec negotiation. The "codec" key is additive — firmware that
+    // predates the on-device Opus change doesn't send it, and such a
+    // stick must keep working against a current app. Observed via the
+    // dump extension, which is the codec's only externally visible
+    // consequence at session start.
+    func testHandleControlStartWithOpusCodecSelectsOggPath() {
+        streamer.handleControl(
+            "{\"type\":\"audio\",\"event\":\"start\",\"sample_rate\":16000,\"codec\":\"opus\"}")
+        XCTAssertEqual(dumpPaths.last?.hasSuffix("out.ogg"), true)
+    }
+
+    func testHandleControlStartWithoutCodecKeyStaysPCM() {
+        streamer.handleControl("{\"type\":\"audio\",\"event\":\"start\",\"sample_rate\":16000}")
+        XCTAssertEqual(dumpPaths.last?.hasSuffix("out.pcm"), true,
+                       "old firmware sends no codec key and must be treated as PCM")
+    }
+
+    func testHandleControlStartWithUnknownCodecFallsBackToPCM() {
+        streamer.handleControl(
+            "{\"type\":\"audio\",\"event\":\"start\",\"sample_rate\":16000,\"codec\":\"flac\"}")
+        XCTAssertEqual(dumpPaths.last?.hasSuffix("out.pcm"), true,
+                       "an unparseable codec must degrade to PCM, not kill the session")
     }
 
     func testHandleControlStopEndsSession() {
@@ -217,18 +323,18 @@ final class AudioStreamerTests: XCTestCase {
 
     func testOnAudioFrameContinuousSeqHasNoGaps() {
         streamer.handlePTT(.start(sampleRate: 16000), tailTrimMs: 0)
-        streamer.onAudioFrame(seq: 0, pcm: Data(repeating: 0, count: 100))
-        streamer.onAudioFrame(seq: 1, pcm: Data(repeating: 0, count: 100))
+        streamer.onAudioFrame(seq: 0, payload: Data(repeating: 0, count: 100))
+        streamer.onAudioFrame(seq: 1, payload: Data(repeating: 0, count: 100))
         XCTAssertEqual(sessionUpdates.last?.gaps, 0)
         XCTAssertEqual(sessionUpdates.last?.bytes, 200)
     }
 
     func testOnAudioFrameDetectsAndPadsGap() {
         streamer.handlePTT(.start(sampleRate: 16000), tailTrimMs: 0)
-        streamer.onAudioFrame(seq: 0, pcm: Data(repeating: 0, count: 100))
+        streamer.onAudioFrame(seq: 0, payload: Data(repeating: 0, count: 100))
         // Skip seq 1 and 2 — expected=1 after first frame, jump to seq=3
         // produces gap=2 and pads 2×100=200 bytes of zeros before pcm.
-        streamer.onAudioFrame(seq: 3, pcm: Data(repeating: 0, count: 100))
+        streamer.onAudioFrame(seq: 3, payload: Data(repeating: 0, count: 100))
         XCTAssertEqual(sessionUpdates.last?.gaps, 2,
                        "two missing seqs must be counted")
         XCTAssertEqual(sessionUpdates.last?.bytes, 100 + 200 + 100,
@@ -237,7 +343,7 @@ final class AudioStreamerTests: XCTestCase {
 
     func testOnAudioFrameDroppedWhenInactive() {
         // No start — onAudioFrame must early-return on !active.
-        streamer.onAudioFrame(seq: 0, pcm: Data(repeating: 0, count: 100))
+        streamer.onAudioFrame(seq: 0, payload: Data(repeating: 0, count: 100))
         XCTAssertEqual(sessionUpdates.count, 0)
     }
 }
