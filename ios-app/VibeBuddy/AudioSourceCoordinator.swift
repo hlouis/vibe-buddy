@@ -73,7 +73,7 @@ final class AudioSourceCoordinator: ObservableObject {
         NSLog("[coord] app backgrounded — disabling mic trigger")
         pttTrigger.disable()
         mic.stop()  // idempotent; covers mid-press backgrounding
-        state.micRunning = false
+        state.micModeReady = false
         state.hotkeyEnabled = false
     }
 
@@ -82,7 +82,7 @@ final class AudioSourceCoordinator: ObservableObject {
     // as cold start.
     func handleAppForegrounded() {
         guard let state, state.audioSource == .mic else { return }
-        if !state.micRunning {
+        if !state.micModeReady {
             Task { await activateMic() }
         }
     }
@@ -124,7 +124,7 @@ final class AudioSourceCoordinator: ObservableObject {
             pttTrigger.disable()
             mic.stop()
             state?.hotkeyEnabled = false
-            state?.micRunning = false
+            state?.micModeReady = false
         }
     }
 
@@ -162,16 +162,32 @@ final class AudioSourceCoordinator: ObservableObject {
         //    The audio engine is NOT started here. We start it on each
         //    PTT press in handlePTT(.start) and tear it down on release
         //    so the iOS orange mic indicator only lights up while the
-        //    user is actually holding the button. The 100–300 ms warmup
-        //    overlaps with AudioStreamer's 400 ms STT warmup window so
-        //    there's no perceptible loss of first-syllable audio.
+        //    user is actually holding the button.
+        //
+        //    That costs real audio: the tap delivers nothing for ~220 ms
+        //    after start(), and those 220 ms of speech are gone. An
+        //    earlier version of this comment claimed AudioStreamer's
+        //    400 ms STT warmup "covered" it — it does not, and cannot.
+        //    That window only delays opening the Doubao socket; it
+        //    cannot buffer audio the hardware never captured. What
+        //    actually absorbs the gap is the user's own reaction time
+        //    between pressing and speaking. Press-and-speak-instantly
+        //    clips the first syllable, and that is the accepted price of
+        //    not leaving the orange dot lit for the whole session.
+        //
+        //    prime() below keeps that gap at 220 ms instead of the
+        //    ~1.5 s an unprimed first press would cost. Measured on
+        //    macOS; iOS is not yet hardware-verified (see
+        //    docs/hardware-debug.md) but the CoreAudio HAL warmup it
+        //    pays for is the same mechanism.
+        mic.prime()
         do {
             try pttTrigger.enable()
             state.hotkeyEnabled = true
-            state.micRunning = true   // "mic mode ready", not "engine on"
+            state.micModeReady = true   // "mic mode ready", not "engine on"
         } catch {
             state.hotkeyEnabled = false
-            state.micRunning = false
+            state.micModeReady = false
             state.hotkeyError = error.localizedDescription
         }
     }
@@ -219,7 +235,7 @@ final class AudioSourceCoordinator: ObservableObject {
             ble.audio.cancelSession()
             pttTrigger.disable()
             mic.stop()  // idempotent; only does work if a press was in flight
-            state?.micRunning = false
+            state?.micModeReady = false
             state?.hotkeyEnabled = false
         case .ended:
             // Don't auto-resume. User decides when they're ready.

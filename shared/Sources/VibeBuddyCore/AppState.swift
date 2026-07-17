@@ -43,16 +43,31 @@ public final class AppState: ObservableObject {
 
     public struct AudioSession: Equatable {
         public var active: Bool
+        // Payload bytes accepted from the audio source. NOTE the unit is
+        // codec-dependent: raw PCM for .pcm, compressed Opus for .opus.
+        // Never derive a duration from this — see `durationSec`.
         public var bytes: Int
         public var gaps: Int
         public var sampleRate: Int
         public var startedAt: Date
-        public init(active: Bool, bytes: Int, gaps: Int, sampleRate: Int, startedAt: Date) {
+        // Wall-clock seconds, stamped by AudioStreamer at each emit — so
+        // it freezes at the right value once the session ends rather
+        // than growing off startedAt forever. The UI used to divide
+        // `bytes` by the PCM byte rate instead, which silently became
+        // ~12x short the moment BLE sessions started carrying Opus.
+        public var durationSec: TimeInterval
+        // What `bytes` is counting, and what the dump file actually is.
+        public var codec: AudioStreamer.Codec
+        public init(active: Bool, bytes: Int, gaps: Int, sampleRate: Int,
+                    startedAt: Date, durationSec: TimeInterval = 0,
+                    codec: AudioStreamer.Codec = .pcm) {
             self.active = active
             self.bytes = bytes
             self.gaps = gaps
             self.sampleRate = sampleRate
             self.startedAt = startedAt
+            self.durationSec = durationSec
+            self.codec = codec
         }
     }
 
@@ -77,7 +92,7 @@ public final class AppState: ObservableObject {
     @Published public var hotkeyEnabled: Bool = false
     @Published public var hotkeyError: String = ""
     @Published public var micAuth: MicAuth = .unknown
-    @Published public var micRunning: Bool = false
+    @Published public var micModeReady: Bool = false
     // Input Monitoring (kIOHIDRequestTypeListenEvent) is a separate
     // TCC service from Accessibility — required for our CGEventTap to
     // observe Right Option key edges. Tracked independently so the UI

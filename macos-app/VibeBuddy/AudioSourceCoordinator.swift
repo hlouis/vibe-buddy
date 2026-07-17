@@ -77,8 +77,17 @@ final class AudioSourceCoordinator: ObservableObject {
 
         // Auto-enable hotkey if we were blocked on Input Monitoring
         // and the user just granted it.
+        //
+        // Gate on mic permission, NOT on micModeReady: activateMic()
+        // only sets that flag once hotkey.enable() has succeeded, so
+        // keying on it here disabled this recovery in the exact case it
+        // exists for — Input Monitoring denied, enable() threw, flag
+        // false, user grants it, nothing happens. It worked before the
+        // engine moved to the press edge only because the flag used to
+        // be set earlier, on mic.start(). The real precondition was
+        // always "the mic itself is usable".
         if state.audioSource == .mic,
-           state.micRunning,
+           micNow == .granted,
            !state.hotkeyEnabled,
            imNow == .granted {
             NSLog("[coord] input monitoring granted out-of-band — enabling hotkey")
@@ -143,7 +152,7 @@ final class AudioSourceCoordinator: ObservableObject {
             hotkey.disable()
             mic.stop()
             state?.hotkeyEnabled = false
-            state?.micRunning = false
+            state?.micModeReady = false
         }
     }
 
@@ -197,19 +206,31 @@ final class AudioSourceCoordinator: ObservableObject {
         //
         //    The audio engine is NOT started here — it gets brought up
         //    lazily on each PTT press in handleHotkeyPTT(.start) and
-        //    torn down on release, so the status-bar mic indicator
-        //    only lights up while the user is actually holding the
-        //    hotkey. The 100–300 ms warmup overlaps AudioStreamer's
-        //    400 ms STT warmup window, so first-syllable audio is
-        //    not perceptibly clipped.
+        //    torn down on release, so the status-bar mic indicator only
+        //    lights up while the user is actually holding the hotkey.
+        //
+        //    That costs real audio: the tap delivers nothing for ~220 ms
+        //    after start(), and those 220 ms of speech are gone. An
+        //    earlier version of this comment claimed AudioStreamer's
+        //    400 ms STT warmup "covered" it — it does not, and cannot.
+        //    That window only delays opening the Doubao socket; it
+        //    cannot buffer audio the hardware never captured. What
+        //    actually absorbs the gap is the user's own reaction time
+        //    between pressing and speaking. Press-and-speak-instantly
+        //    clips the first syllable, and that is the accepted price of
+        //    not leaving the mic indicator lit for the whole session.
+        //
+        //    prime() below keeps that gap at 220 ms instead of the
+        //    ~1.5 s an unprimed first press would cost.
+        mic.prime()
         do {
             try hotkey.enable()
             state.hotkeyEnabled = true
-            state.micRunning = true   // "mic mode ready", not "engine on"
+            state.micModeReady = true   // "mic mode ready", not "engine on"
             state.hotkeyError = ""
         } catch {
             state.hotkeyEnabled = false
-            state.micRunning = false
+            state.micModeReady = false
             state.hotkeyError = imAuth == .granted
                 ? error.localizedDescription
                 : "需要「输入监控」权限。请在系统设置中为 VibeBuddy 打开后回到此窗口，会自动启用。"

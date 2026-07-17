@@ -124,7 +124,7 @@ struct TranscriptTabView: View {
         if state.audioSource == .mic {
             if state.micAuth != .granted { return .red }
             if state.session?.active == true { return .red }
-            return state.micRunning ? .green : .gray
+            return state.micModeReady ? .green : .gray
         }
         switch state.link {
         case .connected:              return .green
@@ -141,7 +141,7 @@ struct TranscriptTabView: View {
             case .notDetermined: return "等待麦克风授权"
             case .granted:
                 if state.session?.active == true { return "🔴 录音中" }
-                return state.micRunning ? "麦克风就绪 — 按住下方按钮说话" : "正在启动麦克风…"
+                return state.micModeReady ? "麦克风就绪 — 按住下方按钮说话" : "正在启动麦克风…"
             case .unknown:       return "正在检查麦克风权限"
             }
         }

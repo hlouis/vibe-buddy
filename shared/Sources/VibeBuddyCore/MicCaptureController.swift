@@ -18,11 +18,11 @@ import Foundation
 // time mic mode is selected, which looks like the app is always
 // listening.
 //
-// Cost of on-demand start: AVAudioEngine warmup is 100–300 ms before
-// the tap delivers its first buffer. AudioStreamer already gates STT
-// with a 400 ms warmup window (see AudioStreamer.sttWarmupMs), so the
-// engine warmup overlaps it and first-syllable audio is not lost in
-// any user-perceptible way.
+// Cost of on-demand start: the tap delivers nothing for ~220 ms after
+// start() (measured, steady state) and that speech is simply lost —
+// AudioStreamer's 400 ms STT warmup does NOT cover it (that window
+// only delays the Doubao socket; it cannot buffer audio the hardware
+// never captured). See prime() and the coordinators for the tradeoff.
 //
 // Cross-platform notes:
 // • macOS: AVAudioEngine works directly off the default input device;
@@ -96,12 +96,64 @@ public final class MicCaptureController {
 
     // MARK: engine lifecycle
 
+    // Pay CoreAudio's one-time, process-wide HAL initialization now
+    // instead of on the user's first PTT press.
+    //
+    // Measured on macOS 15 (tools were a throwaway swiftc probe; numbers
+    // are the whole construct+prepare+start sequence):
+    //
+    //            first cycle in a process    every later cycle
+    //   block         1318 ms                    166 ms
+    //   first buffer  1535 ms                    220 ms
+    //
+    // Unprimed, the first dictation of each app launch would swallow
+    // ~1.5 s of speech and freeze the UI for ~1.3 s — long enough that a
+    // quick tap gets measured past PTTSession's 350 ms click threshold
+    // and turns an intended cancel into a real recording. Primed, every
+    // press is the ~166/220 ms steady-state case.
+    //
+    // Call it when the user selects mic mode: a deliberate action where
+    // a brief indicator flash (and, on iOS, a momentary duck of any
+    // playing audio) is honest about what's being set up. Best-effort by
+    // design — a failure here just means the first press pays the cost.
+    public func prime() {
+        guard !running, engine == nil else { return }
+        #if os(iOS)
+        guard (try? configureAudioSession()) != nil else { return }
+        #endif
+        let e = AVAudioEngine()
+        _ = e.inputNode.inputFormat(forBus: 0)
+        e.prepare()
+        try? e.start()
+        e.stop()
+        #if os(iOS)
+        try? AVAudioSession.sharedInstance()
+            .setActive(false, options: [.notifyOthersOnDeactivation])
+        #endif
+        NSLog("[mic] audio stack primed")
+    }
+
     public func start() throws {
         guard !running else { return }
 
         #if os(iOS)
         try configureAudioSession()
         #endif
+
+        // Every throw past this point must undo configureAudioSession().
+        // It has already called setActive(true) — which ducks the user's
+        // music and lights the system mic indicator — and `running`
+        // stays false on the failure paths, so stop() would hit its
+        // `guard running` and no-op forever. The session would then stay
+        // active, with nothing capturing, until the app is force-quit:
+        // exactly the always-lit indicator this whole press-edge
+        // lifecycle exists to prevent.
+        //
+        // A defer rather than cleanup in each catch because there are
+        // four throwing exits below and the first three are `guard`s
+        // that are easy to add to without noticing this.
+        var started = false
+        defer { if !started { abandonPartialStart() } }
 
         // Fresh engine every time — see the comment on `engine` for
         // why this matters (post-grant input-node rebinding).
@@ -139,14 +191,26 @@ public final class MicCaptureController {
         do {
             try engine.start()
         } catch {
-            input.removeTap(onBus: 0)
-            self.engine = nil
-            self.converter = nil
             throw MicError.engineFailed(error.localizedDescription)
         }
         running = true
+        started = true
         NSLog("[mic] engine running input=%.0fHz/%dch -> 16kHz/1ch Int16",
               inFormat.sampleRate, Int(inFormat.channelCount))
+    }
+
+    // Undo a start() that threw partway. Safe to call at any point after
+    // configureAudioSession(): removeTap on a bus with no tap is a no-op,
+    // and the engine may not exist yet.
+    private func abandonPartialStart() {
+        engine?.inputNode.removeTap(onBus: 0)
+        engine = nil
+        converter = nil
+        #if os(iOS)
+        try? AVAudioSession.sharedInstance()
+            .setActive(false, options: [.notifyOthersOnDeactivation])
+        #endif
+        NSLog("[mic] start failed — released audio session")
     }
 
     public func stop() {
