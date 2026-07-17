@@ -30,7 +30,12 @@ struct VibeBuddyApp: App {
         let st = AppState()
         let pb = PasteboardHandler()
         let inj = WebViewInjector()
-        let br = BrowserState()
+        // Owned here so it can be passed into BrowserState (the
+        // navigation decider needs the same instance to forward
+        // intercepted download requests). BrowserTabView reads it via
+        // browser.downloads, no separate environment entry needed.
+        let dl = BrowserDownloadManager()
+        let br = BrowserState(downloads: dl)
         let bm = BookmarkStore()
         let ps = PolicyStore()
         let rt = TextRouter(pasteboard: pb, webview: inj)

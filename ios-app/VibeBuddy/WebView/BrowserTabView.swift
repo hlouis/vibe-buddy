@@ -41,6 +41,20 @@ struct BrowserTabView: View {
     @AppStorage("statusBarExpanded") private var statusExpanded: Bool = true
     @AppStorage("lastBrowserURL") private var lastURL: String = "https://claude.ai/new"
 
+    // .sheet(item:) wants Identifiable. URL isn't, and we want a fresh
+    // sheet for every download anyway (so re-downloading the same path
+    // re-pops the picker), so each presentation gets a UUID.
+    private var shareItemBinding: Binding<ShareableDownload?> {
+        Binding(
+            get: {
+                browser.downloads.pendingShare.map { ShareableDownload(url: $0) }
+            },
+            set: { newValue in
+                if newValue == nil { browser.downloads.pendingShare = nil }
+            }
+        )
+    }
+
     // Safari-style auto-collapse on iPhone (.full chrome). After a page
     // finishes loading we shrink the top URL row and merge the bottom
     // nav + status rows into a thin strip; tapping either strip — or
@@ -119,6 +133,14 @@ struct BrowserTabView: View {
                 lastURL = url
                 showBookmarks = false
             }
+        }
+        // Pop a share sheet whenever a download finishes. Driven off
+        // BrowserState.downloads.pendingShare — the manager sets it on
+        // success, this binding clears it on dismiss. We wrap the URL
+        // in an Identifiable shim so .sheet(item:) keys correctly when
+        // the same path is re-presented after a second download.
+        .sheet(item: shareItemBinding) { wrapped in
+            DownloadShareSheet(url: wrapped.url)
         }
         .onAppear {
             // Activate the injector against the live WebPage only
@@ -449,6 +471,7 @@ struct BrowserStatusBar: View {
     @EnvironmentObject var state: AppState
     @EnvironmentObject var router: TextRouter
     @EnvironmentObject var injector: WebViewInjector
+    @Environment(BrowserState.self) var browser
     @Binding var expanded: Bool
 
     var body: some View {
@@ -492,6 +515,17 @@ struct BrowserStatusBar: View {
                         .font(.caption2)
                         .foregroundColor(.red)
                         .lineLimit(2)
+                }
+                // Latest download — single row, suppressed when no
+                // downloads have ever been attempted. Tapping a
+                // finished one re-pops the share sheet so the user can
+                // save it again after closing without re-downloading.
+                if let item = browser.downloads.latest {
+                    DownloadStatusRow(item: item) {
+                        if case .finished(let url) = item.state {
+                            browser.downloads.pendingShare = url
+                        }
+                    }
                 }
             }
         }
@@ -639,4 +673,90 @@ private struct AddBookmarkSheet: View {
             }
         }
     }
+}
+
+// MARK: - Download UI
+
+// Identifiable shim so .sheet(item:) re-presents on every download.
+// id is generated per wrapping, not derived from URL, so saving the
+// same file twice still triggers two distinct sheet presentations.
+private struct ShareableDownload: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+// One-row download status (shown inside BrowserStatusBar's expanded
+// area). Active downloads show a spinner; failures show the reason in
+// orange; finished downloads are tappable to re-open the share sheet.
+struct DownloadStatusRow: View {
+    let item: BrowserDownloadManager.Item
+    let onTap: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            icon
+            Text(item.filename)
+                .font(.caption.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            Text(stateText)
+                .font(.caption2)
+                .foregroundStyle(stateColor)
+                .lineLimit(1)
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 8)
+        .background(.gray.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onTap)
+    }
+
+    @ViewBuilder private var icon: some View {
+        switch item.state {
+        case .downloading:
+            ProgressView().controlSize(.mini)
+        case .finished:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .font(.caption)
+        case .failed:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .font(.caption)
+        }
+    }
+
+    private var stateText: String {
+        switch item.state {
+        case .downloading:        return "下载中"
+        case .finished:           return "点击保存"
+        case .failed(let reason): return reason
+        }
+    }
+
+    private var stateColor: Color {
+        switch item.state {
+        case .downloading: return .secondary
+        case .finished:    return .blue
+        case .failed:      return .orange
+        }
+    }
+}
+
+// Plain UIActivityViewController bridge. The "笨但稳" save path: hand
+// the temp-file URL to the system share sheet and let the user pick
+// where it lands — Files, AirDrop, mail, whatever. We don't write to
+// the app's documents dir at all, which means no Info.plist work
+// (UIFileSharingEnabled / LSSupportsOpeningDocumentsInPlace) is
+// required to ship this.
+struct DownloadShareSheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController,
+                                context: Context) {}
 }

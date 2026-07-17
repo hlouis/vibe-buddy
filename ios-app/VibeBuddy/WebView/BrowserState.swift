@@ -86,8 +86,20 @@ final class BrowserState {
     // WebPage makes internally; UCC also retains it but holding here
     // too is the unambiguous fix.
     private let focusBridge = FocusBridge()
+    private let blobBridge = BlobDownloadBridge()
 
-    init() {
+    // Owns the in-browser download pipeline. Held here (not at App
+    // level) so the navigation decider — also constructed in
+    // makePage() — has a single, lifetime-aligned reference. Exposed
+    // via the page environment to BrowserTabView for status/share UI.
+    let downloads: BrowserDownloadManager
+
+    // No default argument: BrowserDownloadManager.init is @MainActor
+    // (the type is) and default expressions evaluate in a nonisolated
+    // context, which would fail the actor check. Caller supplies the
+    // manager — VibeBuddyApp's @MainActor init does this naturally.
+    init(downloads: BrowserDownloadManager) {
+        self.downloads = downloads
         // Bridge callback wired up here; makePage() attaches the bridge
         // to the user content controller whenever the page is finally
         // constructed.
@@ -97,10 +109,37 @@ final class BrowserState {
             let injectable = (body["injectable"] as? Bool) ?? false
             self.onFocusMessage?(descriptor, injectable)
         }
+        // Blob/data-URL downloads come in here. The JS hook ships a
+        // single dictionary per fired download — either {dataUrl,
+        // filename, mime, size} on success or {error, filename} on
+        // failure / oversize. We forward straight to the manager,
+        // which owns dedup + temp-file landing + share-sheet trigger.
+        blobBridge.onMessage = { [weak self] body in
+            guard let self else { return }
+            let filename = (body["filename"] as? String) ?? "download"
+            if let err = body["error"] as? String {
+                self.downloads.appendFailedInline(filename: filename, reason: err)
+                return
+            }
+            guard let dataUrl = body["dataUrl"] as? String else { return }
+            let mime = (body["mime"] as? String) ?? "application/octet-stream"
+            let size = (body["size"] as? Int) ?? 0
+            self.downloads.startFromInlineData(
+                dataUrl: dataUrl,
+                filename: filename,
+                mime: mime,
+                size: size
+            )
+        }
     }
 
     private func makePage() -> WebPage {
         var cfg = WebPage.Configuration()
+        // Explicit so the cookies the decider hands to URLSession come
+        // from the same jar the WebView is actually using. The default
+        // would be `.default()` anyway, but pinning it makes the
+        // contract obvious.
+        cfg.websiteDataStore = .default()
 
         // Inject our focus-tracker into every page at document end so
         // the status bar can show the focused element before the user
@@ -108,6 +147,18 @@ final class BrowserState {
         // WKScriptMessageHandler API as before — Apple kept the
         // userContentController surface intact on WebPage.Configuration.
         let ucc = WKUserContentController()
+        // Blob/data download interceptor MUST go in at document-start
+        // and ahead of every other script — we're monkey-patching
+        // HTMLAnchorElement.prototype.click, and any page script that
+        // captures the original click before we do will route around
+        // us. forMainFrameOnly:false so SPAs that put their export
+        // logic inside a same-origin iframe still get covered.
+        let blobScript = WKUserScript(
+            source: InjectionScript.blobDownloadHook,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        )
+        ucc.addUserScript(blobScript)
         let focusScript = WKUserScript(
             source: InjectionScript.focusTracker,
             injectionTime: .atDocumentEnd,
@@ -124,9 +175,22 @@ final class BrowserState {
         )
         ucc.addUserScript(kbScript)
         ucc.add(focusBridge, name: "vbFocus")
+        ucc.add(blobBridge, name: "vbDownload")
         cfg.userContentController = ucc
 
-        let p = WebPage(configuration: cfg)
+        // Navigation decider intercepts download-intent navigations
+        // (HTML5 `<a download>`, non-renderable MIME types,
+        // Content-Disposition: attachment) and hands them to our
+        // BrowserDownloadManager, which re-fetches via URLSession with
+        // matching cookies. SwiftUI WebPage exposes no callback for
+        // WKDownload created via .download policy, so cancelling the
+        // navigation + re-fetching ourselves is the only way to keep
+        // visibility on the bytes.
+        let decider = BrowserNavigationDecider(
+            manager: downloads,
+            cookieStore: cfg.websiteDataStore.httpCookieStore
+        )
+        let p = WebPage(configuration: cfg, navigationDecider: decider)
 
         // Make this WebView visible to Mac Safari's Web Inspector. Since
         // iOS 16.4, WKWebView (and by extension the iOS 26 WebPage) is
@@ -229,6 +293,23 @@ private final class FocusBridge: NSObject, WKScriptMessageHandler {
     nonisolated func userContentController(_ userContentController: WKUserContentController,
                                            didReceive message: WKScriptMessage) {
         guard message.name == "vbFocus",
+              let body = message.body as? [String: Any] else { return }
+        Task { @MainActor in
+            self.onMessage?(body)
+        }
+    }
+}
+
+// Same pattern as FocusBridge — separate object so the UCC's strong
+// reference doesn't form a cycle with BrowserState. Receives one
+// payload per intercepted blob:/data: download from the JS hook in
+// InjectionScript.blobDownloadHook.
+private final class BlobDownloadBridge: NSObject, WKScriptMessageHandler {
+    var onMessage: (@MainActor ([String: Any]) -> Void)?
+
+    nonisolated func userContentController(_ userContentController: WKUserContentController,
+                                           didReceive message: WKScriptMessage) {
+        guard message.name == "vbDownload",
               let body = message.body as? [String: Any] else { return }
         Task { @MainActor in
             self.onMessage?(body)

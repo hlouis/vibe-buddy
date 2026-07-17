@@ -350,4 +350,111 @@ enum InjectionScript {
         return { ok: false, reason: 'exception', error: String(e) };
     }
     """#
+
+    // Document-start user script that intercepts blob:/data: downloads
+    // so native code can save them. Must be document-start so we patch
+    // HTMLAnchorElement.prototype.click *before* any page script grabs
+    // a reference to the original.
+    //
+    // Two-layer interception (one is not enough):
+    //
+    //   1. Monkey-patch HTMLAnchorElement.prototype.click. Catches the
+    //      "create <a>, set href to blob:, call .click()" pattern even
+    //      when the <a> is detached from the DOM — and that *is* the
+    //      common pattern (FileSaver.js, SheetJS, ExcelJS all do this
+    //      with no appendChild). A document-level click listener can't
+    //      see those because detached-element events don't propagate up.
+    //   2. document.addEventListener('click', ..., true) as a fallback
+    //      for the actually-in-the-DOM case (user clicks a real
+    //      <a download href=blob:>).
+    //
+    // Patterns this does NOT catch (acceptable v1 limitations):
+    //   • window.open(blobUrl)
+    //   • window.location.href = blobUrl
+    //   • cross-origin iframe-internal triggers
+    //
+    // Native side wires this to a WKScriptMessageHandler named
+    // "vbDownload" — see BlobDownloadBridge in BrowserState.swift.
+    static let blobDownloadHook: String = #"""
+    (function() {
+        if (window.__vbBlobHookInstalled) return;
+        window.__vbBlobHookInstalled = true;
+
+        // 50MB cap. base64 over the WebKit ↔ App IPC bridge balloons
+        // memory roughly 3-4x (JS string + base64 inflation + native
+        // copy on the receive side), and anything bigger risks an OOM
+        // before we even hit save. SPAs producing Excel rarely break
+        // single-digit MB, so this leaves plenty of headroom.
+        const MAX_BYTES = 50 * 1024 * 1024;
+
+        function post(msg) {
+            try {
+                window.webkit.messageHandlers.vbDownload.postMessage(msg);
+            } catch (e) {
+                // Native handler missing — shouldn't happen in this app,
+                // but better to no-op than throw and break the page.
+            }
+        }
+
+        async function handle(href, filename) {
+            try {
+                const res = await fetch(href);
+                const blob = await res.blob();
+                if (blob.size > MAX_BYTES) {
+                    post({
+                        error: '文件超过 50MB 上限',
+                        filename: filename,
+                        size: blob.size,
+                    });
+                    return;
+                }
+                const reader = new FileReader();
+                reader.onerror = () => post({
+                    error: 'FileReader 失败',
+                    filename: filename,
+                });
+                reader.onload = () => post({
+                    dataUrl: reader.result,
+                    filename: filename,
+                    mime: blob.type || 'application/octet-stream',
+                    size: blob.size,
+                });
+                reader.readAsDataURL(blob);
+            } catch (err) {
+                post({ error: String(err), filename: filename });
+            }
+        }
+
+        function isHandledHref(href) {
+            return typeof href === 'string'
+                && (href.startsWith('blob:') || href.startsWith('data:'));
+        }
+
+        // Layer 1: HTMLAnchorElement.prototype.click monkey-patch.
+        // Captures detached-<a>.click() — the dominant SPA pattern.
+        const origClick = HTMLAnchorElement.prototype.click;
+        HTMLAnchorElement.prototype.click = function() {
+            try {
+                if (this.hasAttribute('download') && isHandledHref(this.href)) {
+                    const name = this.getAttribute('download') || 'download';
+                    handle(this.href, name);
+                    return; // swallow — iOS WebKit can't save blobs natively anyway
+                }
+            } catch (e) { /* fall through to original */ }
+            return origClick.apply(this, arguments);
+        };
+
+        // Layer 2: capture-phase document click listener.
+        // Catches user-initiated clicks on attached <a download>.
+        document.addEventListener('click', function(e) {
+            const a = e.target && e.target.closest && e.target.closest('a[download]');
+            if (!a) return;
+            if (!isHandledHref(a.href)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const name = a.getAttribute('download') || 'download';
+            handle(a.href, name);
+        }, true);
+    })();
+    """#
 }
