@@ -74,6 +74,14 @@ final class FocusGate {
             return (true, "\(frontApp): role=\(role)")
         }
 
+        // Focus resolving to the window itself means AX can't see inside:
+        // the app draws its own content and takes keys at window level
+        // (GPU-rendered terminals such as Herdr). Same uncertainty as "no
+        // focused element" above, so the same permissive answer.
+        if role == "AXWindow" {
+            return (true, "\(frontApp): role=AXWindow, opaque to AX (allow)")
+        }
+
         // Some apps expose selected-text even when value isn't settable.
         var selRaw: AnyObject?
         if AXUIElementCopyAttributeValue(focused, kAXSelectedTextAttribute as CFString, &selRaw) == .success {
