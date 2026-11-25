@@ -307,7 +307,7 @@ iOS 端关键标签：`[ble]` / `[stt]` / `[wv]`（WebView 注入）。模拟器
 
 ### 几处踩坑经验
 
-- `loopTask` 默认栈只有 8 KB，`opus_encode()` 直接捅穿 → `SET_LOOP_TASK_STACK_SIZE(32 * 1024)`。**这个崩溃从主机侧看是「BLE 4 秒超时断连」**，因为设备崩溃时不发 disconnect PDU
+- `loopTask` 默认栈只有 8 KB，`opus_encode()` 直接捅穿 → `sdkconfig.defaults` 的 `CONFIG_ARDUINO_LOOP_STACK_SIZE`。**这个崩溃从主机侧看是「BLE 4 秒超时断连」**，因为设备崩溃时不发 disconnect PDU
 - Ogg EOS 页必须声明**零个** lacing segment，不是「一个长度为 0 的 segment」——后者等于声明一个零字节包，Opus 里不存在，ffmpeg 拒收整个流。单测断言过这个 bug 且全绿，是 `make test-ogg` 抓到的
 - StickS3 的扬声器与麦克风共享 ES8311，用 `cfg.internal_spk = false` 释放 I2S
 - M5Unified 的 `M5.Mic.record()` 异步 API 用单缓冲会产生 chunk 重复 → 用 ping-pong

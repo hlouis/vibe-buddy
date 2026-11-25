@@ -5,23 +5,11 @@
 #include "ble_bridge.h"
 #include "recorder.h"
 
-// recorderTick() runs opus_encode() from loop(), and libopus wants far
-// more stack than Arduino's 8 KB default for loopTask: the first encode
-// of the first session blew it every time, which the ESP32 reports as
-//
-//   ***ERROR*** A stack overflow in task loopTask has been detected.
-//
-// then reboots. From the Mac's side that looked nothing like a crash —
-// the device stopped sending mid-session and the link only died 4 s
-// later on supervision timeout, so it read as "BLE went quiet".
-//
-// The stack is now set via CONFIG_ARDUINO_LOOP_STACK_SIZE in
-// sdkconfig.defaults, NOT SET_LOOP_TASK_STACK_SIZE. That macro works by
-// overriding a weak symbol in the precompiled core's main.cpp, and since
-// the espidf-component build compiles the Arduino core from source with
-// its own Kconfig, the macro is a no-op there. Same 32 KB, different
-// lever — if you ever go back to `framework = arduino`, this has to come
-// back or the crash returns.
+// recorderTick() runs opus_encode() from loop(), and libopus needs far
+// more than Arduino's 8 KB default loopTask stack. The stack size lives in
+// sdkconfig.defaults (CONFIG_ARDUINO_LOOP_STACK_SIZE); SET_LOOP_TASK_STACK_SIZE
+// has no effect in the espidf-component build. Overflow symptoms (it looks
+// like a BLE timeout from the host): docs/hardware-debug.md.
 
 static char deviceName[20] = "VibeBuddy";
 static bool btnAHeld = false;
@@ -124,43 +112,29 @@ static void updateBrightness() {
   applyBrightness(target);
 }
 
-// Power management. Driven by esp_pm locks rather than direct
-// setCpuFrequencyMhz() calls: with CONFIG_PM_ENABLE the PM layer owns the
-// clock, and a manual override just fights it.
+// Power management. esp_pm owns the clock (CONFIG_PM_ENABLE, see
+// sdkconfig.defaults), so we express needs as locks instead of calling
+// setCpuFrequencyMhz(), which would fight it. Light sleep happens only
+// when no lock of any kind is held.
 //
-// This only became possible by building Arduino as an ESP-IDF component.
-// The precompiled core has CONFIG_PM_ENABLE compiled out entirely, so
-// both cores spun at full clock forever and the BLE radio never powered
-// down between connection events — the device was warm sitting idle with
-// the screen off, and no CPU-frequency or connection-interval tuning
-// could touch it. See sdkconfig.defaults.
+//  • cpuLock (CPU_FREQ_MAX) — recording, or screen at full brightness.
+//    Recording needs 240 MHz: Opus encoding eats a third of realtime there
+//    and blows the 60 ms frame budget at 80 (MAX_ENCODES_PER_TICK in
+//    recorder.cpp). Holding it also blocks light sleep, which is what
+//    keeps I2S DMA (live session, pre-warmed mic) running.
 //
-// Three locks, each for a distinct reason:
-//
-//  • cpuLock (CPU_FREQ_MAX) — held while recording or while the screen is
-//    at full brightness. Recording needs it because Opus encoding eats a
-//    third of realtime at 240 MHz and would blow the 60 ms frame budget
-//    at 80 (see MAX_ENCODES_PER_TICK in recorder.cpp).
-//
-//  • recSleepLock (NO_LIGHT_SLEEP) — held while recording. CPU_FREQ_MAX
-//    pins the clock but does NOT prevent sleep, and sleeping mid-session
-//    would cut I2S DMA. Sessions are seconds long, so this costs nothing.
-//
-//  • usbSleepLock (NO_LIGHT_SLEEP) — held while VBUS is present. Light
-//    sleep drops the USB Serial JTAG console, which would silently break
-//    `make fw-capture` and every serial-based debug workflow. On USB
-//    there is no battery to protect anyway — the same reasoning that
-//    already pins the backlight on in updateBrightness(). Sleep is for
-//    battery, which is the only case that ever needed it.
+//  • awakeLock (NO_LIGHT_SLEEP) — backlight lit, or USB powered.
+//    The backlight is LEDC PWM on the APB clock, which stops in light
+//    sleep and would freeze the dimmed screen at full-on or off. Light
+//    sleep also drops the USB Serial JTAG console that `make fw-capture`
+//    depends on, and on USB there is no battery to save.
 static constexpr uint32_t CPU_HIGH_MHZ = 240;
 static constexpr uint32_t CPU_LOW_MHZ  = 80;
 
 static esp_pm_lock_handle_t cpuLock = nullptr;
-static esp_pm_lock_handle_t recSleepLock = nullptr;
-static esp_pm_lock_handle_t usbSleepLock = nullptr;
+static esp_pm_lock_handle_t awakeLock = nullptr;
 static bool cpuLockHeld = false;
-static bool recSleepHeld = false;
-static bool usbSleepHeld = false;
+static bool awakeLockHeld = false;
 
 static void holdLock(esp_pm_lock_handle_t h, bool& held, bool want, const char* tag) {
   if (!h || want == held) return;
@@ -169,15 +143,14 @@ static void holdLock(esp_pm_lock_handle_t h, bool& held, bool want, const char* 
   Serial.printf("[pm] %s %s\n", tag, want ? "acquire" : "release");
 }
 
+static bool wantAwake() {
+  return currentBrightness != BRIGHT_OFF || g_usbPowered;
+}
+
 static void initPowerManagement() {
-  // Seed g_usbPowered BEFORE light sleep can ever happen. It is otherwise
-  // only refreshed by the 10 s battery poll, and its initial false meant
-  // usbSleepLock stayed unheld for the first ten seconds of every boot —
-  // long enough for the system to idle, light-sleep, and take the USB
-  // Serial JTAG console down with it. The device ran fine (BLE connected,
-  // heartbeats flowing); the serial log just stopped dead at phy_init and
-  // looked exactly like a hang. Read VBUS here so the lock is right from
-  // the first opportunity to sleep.
+  // g_usbPowered is otherwise first set by the 10 s battery poll. Read
+  // VBUS now so awakeLock is correct before the first chance to sleep;
+  // a wrong value here silently kills the serial console during boot.
   int16_t vbus = M5.Power.getVBUSVoltage();
   g_usbPowered = (vbus < 0) ? M5.Power.isCharging() : (vbus > 4000);
   Serial.printf("[pm] boot vbus=%d usb=%d\n", (int)vbus, g_usbPowered ? 1 : 0);
@@ -193,22 +166,17 @@ static void initPowerManagement() {
   Serial.printf("[pm] configure %u/%u MHz light_sleep=1 -> %s\n",
                 (unsigned)CPU_HIGH_MHZ, (unsigned)CPU_LOW_MHZ, esp_err_to_name(e));
 
-  esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX,   0, "cpu", &cpuLock);
-  esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "rec", &recSleepLock);
-  esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "usb", &usbSleepLock);
+  esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX,   0, "cpu",   &cpuLock);
+  esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "awake", &awakeLock);
 
-  // Take the USB lock here, not on the first updateCpuFreq() in loop():
-  // the window between esp_pm_configure() and the first loop pass is
-  // itself long enough (BLE init, radio calibration) for the system to
-  // idle and sleep, which is where the console was being lost.
-  holdLock(usbSleepLock, usbSleepHeld, g_usbPowered, "usb-nosleep");
+  // Take it here, not on the first updatePowerLocks() in loop(): BLE init
+  // and radio calibration in between are long enough to idle into sleep.
+  holdLock(awakeLock, awakeLockHeld, wantAwake(), "awake");
 }
 
-static void updateCpuFreq() {
-  bool busy = recorderActive() || currentBrightness == BRIGHT_FULL;
-  holdLock(cpuLock,      cpuLockHeld,  busy,             "cpu");
-  holdLock(recSleepLock, recSleepHeld, recorderActive(), "rec-nosleep");
-  holdLock(usbSleepLock, usbSleepHeld, g_usbPowered,     "usb-nosleep");
+static void updatePowerLocks() {
+  holdLock(cpuLock,   cpuLockHeld,   recorderActive() || currentBrightness == BRIGHT_FULL, "cpu");
+  holdLock(awakeLock, awakeLockHeld, wantAwake(), "awake");
 }
 
 // Power profiling tick — 1 s cadence. AXP2101 on StickS3 does not expose
@@ -652,23 +620,23 @@ void loop() {
     if (slopeIdx == 0) slopeFull = true;
     g_mvPerMin = computeMvPerMin();
     drawPowerHud();
-    Serial.printf("[pwr] mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u cpu=%u\n",
+    // pmcpu/pmawake = which of our esp_pm locks are held. The actual CPU
+    // clock is not logged: read from a task it always reports max (see
+    // docs/hardware-debug.md).
+    Serial.printf("[pwr] mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u pmcpu=%d pmawake=%d\n",
                   g_mv, g_mvPerMin,
                   bleConnected() ? 1 : 0,
                   recorderActive() ? 1 : 0,
                   btnAHeld ? 1 : 0,
                   (unsigned)currentBrightness,
-                  (unsigned)getCpuFrequencyMhz());
-    // pm* = which esp_pm locks WE hold. If cpu=240 while pmcpu=0, the
-    // CPU_FREQ_MAX lock is being held by something other than us.
-    bleLogf("mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u cpu=%u pmcpu=%d pmrec=%d pmusb=%d",
+                  cpuLockHeld ? 1 : 0, awakeLockHeld ? 1 : 0);
+    bleLogf("mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u pmcpu=%d pmawake=%d",
             g_mv, g_mvPerMin,
             bleConnected() ? 1 : 0,
             recorderActive() ? 1 : 0,
             btnAHeld ? 1 : 0,
             (unsigned)currentBrightness,
-            (unsigned)getCpuFrequencyMhz(),
-            cpuLockHeld ? 1 : 0, recSleepHeld ? 1 : 0, usbSleepHeld ? 1 : 0);
+            cpuLockHeld ? 1 : 0, awakeLockHeld ? 1 : 0);
   }
 
   if (lastBatteryPoll == 0 || now - lastBatteryPoll >= BATTERY_POLL_MS) {
@@ -779,7 +747,7 @@ void loop() {
   }
 
   updateBrightness();
-  updateCpuFreq();
+  updatePowerLocks();
   // Pre-warm the mic codec while the user is plausibly about to press
   // BtnA — i.e., screen is at full brightness AND the BLE link is
   // ready. Removes the ~100 ms cold-start gap, which is 100 ms of speech
@@ -793,30 +761,17 @@ void loop() {
   // the old behavior stands, warm for DIM_AFTER_MS after real activity.
   recorderSetMicWarm(bleLinkReady() && currentBrightness == BRIGHT_FULL);
 
-  // How long we yield here decides whether light sleep can ever happen.
+  // How long we yield here decides whether light sleep can happen even
+  // with no lock held. Tickless idle sleeps only if the next task wake-up
+  // is at least CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP ticks (3 ms) away,
+  // so delay(2) can never sleep.
   //
-  // FreeRTOS tickless idle only sleeps once the idle task has held the
-  // core for CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP — 3 ticks, i.e. 3 ms
-  // at HZ=1000. A flat delay(2) hands it 2 ms and then takes the core
-  // back, so the threshold is never reached and the CPU never sleeps.
-  // Enabling PM bought us nothing until this line changed: the device
-  // still ran warm sitting idle, because our own loop was what kept it
-  // awake.
-  //
-  // (Chasing this was slow because the obvious check is a lie. esp_pm
-  // gives each core an internal CPU_FREQ_MAX lock — "rtos0"/"rtos1" in
-  // pm_impl.c — that is held for as long as anything is runnable on it.
-  // Any getCpuFrequencyMhz() call therefore runs inside a task holding
-  // that lock and always reports the max. Task-side code structurally
-  // cannot observe the idle frequency.)
-  //
-  // 2 ms while there's work — recorderTick drains the ring aggressively
-  // in one call and the audio path wants the tight cadence. 50 ms once
-  // the screen is off and nothing is recording, which clears the sleep
-  // threshold by a wide margin. Buttons are polled, not interrupts, so
-  // this is also their worst-case detection latency: 50 ms is under the
-  // ~100 ms a press feels instant at, and it only applies once the
-  // screen has already gone dark.
+  // 2 ms while recording (recorderTick drains the ring in one call, the
+  // audio path wants the tight cadence) and while the screen is lit: a
+  // lit-screen BtnA press starts recording directly, and polling latency
+  // there would cut the start of the utterance. 50 ms once the screen is
+  // off: buttons are polled, and the first press on a dark screen only
+  // wakes it, so the extra latency costs nothing.
   bool busy = recorderActive() || currentBrightness != BRIGHT_OFF;
   delay(busy ? 2 : 50);
 }

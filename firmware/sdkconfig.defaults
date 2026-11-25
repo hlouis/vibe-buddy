@@ -2,23 +2,15 @@
 # Arduino as an IDF component (`framework = arduino, espidf`) rather than
 # using the precompiled Arduino core.
 #
-# WHY THIS FILE EXISTS
+# This file is the only source of truth. PlatformIO generates
+# sdkconfig.<env> from it (gitignored); an existing generated file wins
+# over these defaults, so after editing here delete
+# firmware/sdkconfig.m5stack-sticks3 before building.
 #
-# The precompiled arduino-esp32 core ships with power management compiled
-# OUT. Its sdkconfig has, verbatim:
-#
-#   # CONFIG_PM_ENABLE is not set
-#   # CONFIG_BT_CTRL_MODEM_SLEEP is not set
-#
-# So esp_pm_configure() is not merely unused, it does not exist: both CPU
-# cores spin at their full clock forever and the BLE radio never powers
-# down between connection events. The device is warm sitting idle with the
-# screen off, and no amount of tuning connection intervals or dropping to
-# 80 MHz changes it — a radio that never sleeps doesn't care how many
-# connection events it skips.
-#
-# Everything below that isn't PM is here to reproduce what the precompiled
-# core gave us for free.
+# The precompiled core has CONFIG_PM_ENABLE and CONFIG_BT_CTRL_MODEM_SLEEP
+# compiled out, so light sleep and BT modem sleep are unreachable there.
+# Everything below that isn't PM reproduces what the precompiled core
+# configured.
 
 CONFIG_IDF_TARGET="esp32s3"
 
@@ -29,13 +21,8 @@ CONFIG_IDF_TARGET="esp32s3"
 # The BT MAC is derived from the base MAC by an offset that depends on how
 # many universal MACs are allocated: with TWO it is base+1, with FOUR the
 # WiFi-AP address takes that slot and BT becomes base+2. ESP-IDF defaults
-# to FOUR; the prebuilt Arduino core used TWO.
-#
-# Leaving this at the IDF default silently renamed the device from
-# VibeBuddy-67AD to VibeBuddy-67AE on the very first boot after the
-# migration — which would have invalidated every already-paired install's
-# whitelist and left the app unable to connect, for a build-system change
-# that has nothing to do with identity.
+# to FOUR; the prebuilt Arduino core used TWO. Changing it renames the
+# device and silently invalidates every paired install's whitelist.
 CONFIG_ESP32S3_UNIVERSAL_MAC_ADDRESSES_TWO=y
 CONFIG_ESP32S3_UNIVERSAL_MAC_ADDRESSES=2
 
@@ -89,11 +76,10 @@ CONFIG_BT_CTRL_MAIN_XTAL_PU_DURING_LIGHT_SLEEP=y
 # whereas the prebuilt core always linked it.
 CONFIG_AUTOSTART_ARDUINO=y
 
-# Replaces SET_LOOP_TASK_STACK_SIZE(32 * 1024) from main.cpp: that macro
-# overrides a weak symbol in the precompiled core's main.cpp, which we no
-# longer link. libopus needs far more than the 8 KB default — see the
-# comment at the top of main.cpp for the crash it caused. Only has effect
-# with CONFIG_AUTOSTART_ARDUINO above.
+# loopTask stack. libopus (opus_encode in loop()) needs far more than the
+# 8 KB default; overflow symptoms in docs/hardware-debug.md.
+# SET_LOOP_TASK_STACK_SIZE has no effect in this build — it overrides a
+# weak symbol in the precompiled core only. Requires AUTOSTART_ARDUINO.
 CONFIG_ARDUINO_LOOP_STACK_SIZE=32768
 
 # NOT setting CONFIG_SPIRAM. The only thing that ever wanted PSRAM was the
