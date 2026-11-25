@@ -16,7 +16,7 @@ make build        # 同时编 macos + ios（Debug）
 make test         # SwiftPM + iOS 模拟器全部单测
 make test-shared  # 只跑 VibeBuddyCore（最快的反馈环）
 make fw-upload    # 编固件并烧到 StickS3
-make fw-monitor   # 串口日志（115200，标签：[boot] [ble] [link] [rec] [mic] [tick]）
+make fw-monitor   # 串口日志（115200，标签：[boot] [ble] [rec] [btn] [pm] [pwr] [tick]）
 make open         # 打开 VibeBuddy.xcworkspace
 ```
 
@@ -64,7 +64,7 @@ BLE   → Opus 包 → 按整包 trim → OggOpusMuxer → STT(ogg/opus)   ← �
 
 - **`PTTTrigger.swift`**：协议，把"按下/松开"事件抽象掉。两个具体实现分别在 `macos-app/HotKeyPTTTrigger.swift`（全局热键）和 `ios-app/ButtonPTTTrigger.swift`（屏幕按键）。
 - **`PTTSession.swift`**：会话状态机，串起 trigger → 音源 → STT。所有"按下时启 / 松开时停"的协调点都在这里。
-- **`MicCaptureController.swift`**：本机麦克风采集（AVAudioEngine）。**生命周期必须严格绑到 PTT 事件**——按下才 start，松开就 stop & 释放——否则系统状态栏麦克风指示灯会一直亮。两端 App 通过 `AudioSourceCoordinator.swift` 在 BLE 音源 / 本机麦音源之间切换。
+- **`MicCaptureController.swift`**：本机麦克风采集（AVAudioEngine）。**生命周期必须严格绑到 PTT 事件**——按下才 start，松开就 stop & 释放——否则系统状态栏麦克风指示灯会一直亮。BLE 音源 / 本机麦音源之间的切换在各 App 自己的 `AudioSourceCoordinator.swift` 里（`macos-app/`、`ios-app/` 各一份）。
 - **`BLEController.swift`**：CoreBluetooth Central，按 NUS 协议跑帧分派。文本帧 `\n` 结束、二进制帧魔数 `0xFF 0xAA` 起头（详见 README "BLE 协议要点"）。同时管设备配对白名单（`PairedDeviceStore`）——**白名单为空 = 连第一个看见的**，这是为了不破坏老安装。
 - **`AudioStreamer.swift`**：按 session codec 分流。PCM（麦克风）切 200ms chunk；Opus（BLE）按整包 trim 后交给 `OggOpusMuxer`。**Opus 永不解码**——主机没有也不需要 libopus。
 - **`OggOpusMuxer.swift`**：把裸 Opus 包封成 Ogg（RFC 7845），一包一页。改这里必须同步改 `tools/ble_audio_dump.py` 里的移植版，并跑 `make test-ogg`（拿真 Opus 包过 muxer 再让 ffmpeg 解码）。单测只能验证我们自己的假设——EOS 页曾经因为多写了一个零长 lacing segment 而被 ffmpeg 拒收，而所有单测都是绿的。
@@ -92,7 +92,9 @@ CGEvent + 最长公共前缀 diff，按 partial 增量打字。`FocusGate.swift`
 - **macOS 14 (Sonoma)** 是下限（CoreBluetooth + Accessibility 行为）。
 - 麦克风 / BLE 音源切换之后，旧音源必须停干净——任何"start 了没 stop"的路径都会导致系统麦指示灯常亮、电量异常或 GATT 通道占用。审改 `MicCaptureController` / `AudioSourceCoordinator` / `PTTSession` 时第一反射就是检查"释放对称"。
 - 固件侧 BLE 协商参数（MTU 517、DLE 251、conn interval 15ms）是端到端 <1s 延迟的前提；peripheral latency 30 是空闲省电的前提（不改变有数据时的延迟），见 `ble_bridge.cpp` 的 update_conn_params，详细 trade-off 在 README "BLE 协议要点" + "关键设计决策"。**2M PHY 是优化不是要求**——Opus 只要 ~20 kbps，1M 够用；真正制约录音的是 MTU（一帧必须装进一个 notify，`recorderLinkOk()` 是那个谓词）。
-- **Opus 编码有实测的时间预算**：一帧 60ms 音频要 19–22ms（240MHz / complexity 1，随内容波动），占实时的三分之一。因此录音全程必须锁 240MHz（`main.cpp` 的 DFS 按 `recorderActive()` 拉满；80MHz 下要 ~66ms 直接超预算）且 complexity 不能上调——破了会让编码慢于实时，`MAX_ENCODES_PER_TICK` 是最后一道闸。改 codec 参数或调频策略后回来看 `[rec] stopped` 里的 `enc=` 数字。
+- **Opus 编码有实测的时间预算**：一帧 60ms 音频要 19–22ms（240MHz / complexity 1，随内容波动），占实时的三分之一。因此录音全程必须锁 240MHz（`main.cpp` 的 `cpuLock` 在录音时持有；80MHz 下要 ~66ms 直接超预算）且 complexity 不能上调——破了会让编码慢于实时，`MAX_ENCODES_PER_TICK` 是最后一道闸。改 codec 参数或调频策略后回来看 `[rec] stopped` 里的 `enc=` 数字。
+- **固件开着 light sleep，唤醒频率决定功耗**：没有 esp_pm 锁时自动睡，需求只用 `cpuLock` / `awakeLock` 表达（`main.cpp` 的 `updatePowerLocks()`），不要直接调 `setCpuFrequencyMhz()`。熄屏空闲的唤醒源都已收住（录音任务等通知、BLE peripheral latency、按键中断唤醒的 `idleWait()`），任何新的周期性唤醒都会把睡眠切碎。改完拔线熄屏，看 BLE 日志里 `[pwr]` 的 `slp=` / `wk=`（判读见 `docs/hardware-debug.md`「功耗测量」）。
+- **light sleep 会停掉 USB 枚举**：睡眠中插线主机会放弃枚举，固件靠检测 VBUS 后拉 D+ 逼主机重枚举（`usbReenumerate()`）。插着 USB 时 `awakeLock` 不放，串口和 `make fw-capture` 才可用。
 - **`loopTask` 默认栈 8KB**，`opus_encode()` 会捅穿 → `sdkconfig.defaults` 的 `CONFIG_ARDUINO_LOOP_STACK_SIZE`（`SET_LOOP_TASK_STACK_SIZE` 在 espidf 组件构建下无效）。任何要在 `loop()` 里调的重型库都得先想栈。
 - 提交规范看用户全局 CLAUDE.md（Conventional Commits，scope 用域名，描述中文，不要 Co-Author / Claude Code 字样，**不要主动 commit/push**）。
 
@@ -106,13 +108,12 @@ CGEvent + 最长公共前缀 diff，按 partial 增量打字。`FocusGate.swift`
 
 **完整流程见 `docs/hardware-debug.md`。** 速查：
 
-- **串口**：`make fw-monitor` 交互式；`make fw-capture &` 后台录到 `/tmp/vibebuddy-serial.txt`（`fw-monitor` 需要 TTY，后台跑会抛 traceback）；`make fw-capture ARGS="--reset --seconds 10"` 抓启动/崩溃。关键标签 `[boot] [ble] [link] [rec] [mic] [tick] [pwr]`——**`[tick]` 是判断设备崩没崩过的关键**（1Hz 递增，跑了十几分钟却只有十几 = 刚重启）。
-- **macOS App 日志**：`open --stdout /tmp/vb.txt --stderr /tmp/vb.txt <VibeBuddy.app>`。**`log stream --predicate 'process == "VibeBuddy"'` 看不到我们的 NSLog**；**直接跑二进制会因 TCC 归属到终端而拿不到蓝牙权限**（程序活着但没有任何 `[ble]` 输出）。
+- **串口**：`make fw-monitor` 交互式；`make fw-capture &` 后台录到 `/tmp/vibebuddy-serial.txt`（`fw-monitor` 需要 TTY，后台跑会抛 traceback）；`make fw-capture ARGS="--reset --seconds 10"` 抓启动/崩溃。关键标签 `[boot] [ble] [rec] [btn] [pm] [pwr] [tick]`——**`[tick]` 是判断设备崩没崩过的关键**（1Hz 递增，跑了十几分钟却只有十几 = 刚重启）。
+- **macOS App 日志**：`open --stdout /tmp/vb.txt --stderr /tmp/vb.txt <VibeBuddy.app>`。**`log stream --predicate 'process == "VibeBuddy"'` 看不到我们的 NSLog**；**直接跑二进制会因 TCC 归属到终端而拿不到蓝牙权限**（程序活着但没有任何 `[ble]` 输出）。关键标签 `[ble] [json] [audio] [stt] [focus]`。
 - **纯 BLE 验证（不走豆包）**：`tools/ble_audio_dump.py`（bleak 客户端）抓音频落盘，绕开 App + ASR。固件发 Opus 时自动封成可直接播放的 `out.ogg`。bleak 的蓝牙权限归属到终端 App，需要在系统设置里放行。
 - **Ogg 封装验证**：`make test-ogg` —— 真 Opus 包 → 我们的 muxer → ffmpeg 解码 → 检查音调还在。
-- **macOS 日志**：`log stream --predicate 'process == "VibeBuddy"' --style compact`，关键标签 `[ble] [json] [audio] [stt]`。
 - **iOS 日志**：模拟器在 Xcode console 看，真机用 Console.app 按 `VibeBuddy` 过滤。关键标签 `[ble] [stt] [wv]`。
-- **固件日志**：`make fw-monitor`，标签 `[boot] [ble] [link] [rec] [mic] [tick] [rec-tick]`。
+- **固件日志**：`make fw-monitor`，标签 `[boot] [ble] [rec] [rec-tick] [btn] [pm] [pwr] [tick]`。
 
 ## 端到端验证
 

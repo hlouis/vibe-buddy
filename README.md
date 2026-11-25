@@ -1,9 +1,9 @@
 # Vibe Buddy
 
-按住 M5Stack StickS3 的 A 按钮录音，App 调用豆包流式 ASR 实时转写。macOS 版直接把文字**增量注入当前焦点应用**；iOS / iPadOS 版受系统沙盒限制无法跨 App 注入，改为在 App 内显示并自动写入剪贴板，或者通过内嵌 WebView 注入到当前焦点的网页输入框。
+按住 M5Stack StickS3 的 A 按钮录音（没有设备时也可以用本机麦克风：macOS 按住全局热键（默认右 Option），iOS 按住屏幕按钮），App 调用豆包流式 ASR 实时转写。macOS 版直接把文字**增量注入当前焦点应用**；iOS / iPadOS 版受系统沙盒限制无法跨 App 注入，改为在 App 内显示并自动写入剪贴板，或者通过内嵌 WebView 注入到当前焦点的网页输入框。
 
 ```
-[ StickS3 ]  ——按住A录音——>  PCM 流 (BLE 2M PHY)
+[ StickS3 ]  ——按住A录音——>  Opus 流 (BLE)     
      |                              |
      +—— 屏幕状态 & 电量              v
                           ┌─────────────────────┐
@@ -24,62 +24,27 @@ Phase 1 在 M5Stack StickS3 + 2M PHY + 豆包 `bigmodel` 上验证通过，端�
 
 ```
 vibe-buddy/
-├── Makefile                        # 顶层命令入口（make / make gen / make build / ...）
-├── VibeBuddy.xcworkspace           # 顶层 workspace（macOS + iOS + Core）
-├── docs/                           # 外部参考资料
-│   └── doubao-asr-offical-doc.md
-├── firmware/                       # M5Stack StickS3 固件（C++/Arduino）
+├── Makefile                 # 唯一命令入口，敲 make 看菜单
+├── VibeBuddy.xcworkspace    # macOS + iOS + Core
+├── firmware/                # StickS3 固件：Arduino 作为 ESP-IDF 组件构建（PlatformIO）
 │   ├── platformio.ini
-│   └── src/
-│       ├── main.cpp                # 主循环、状态机、屏幕、电量进度条
-│       ├── ble_bridge.{h,cpp}      # NUS 服务端、2M PHY/DLE 协商
-│       └── recorder.{h,cpp}        # M5.Mic 录音、ping-pong 缓冲、BLE 分包
-├── shared/                         # 共享业务逻辑（Swift Package）
-│   ├── Package.swift
-│   └── Sources/VibeBuddyCore/
-│       ├── BLEController.swift     # CoreBluetooth Central、帧分派
-│       ├── AudioStreamer.swift     # 200ms 裁剪、累积成 ASR chunk
-│       ├── STTService.swift        # 豆包二进制协议 + WebSocket
-│       ├── Gzip.swift              # Compression 框架 + 手动 gzip 封装
-│       ├── AppState.swift          # 视图模型（@MainActor ObservableObject）
-│       ├── Config.swift            # 凭证存储（macOS=XDG，iOS=UserDefaults）
-│       └── TextHandler.swift       # 跨平台文字处理协议
-├── macos-app/                      # macOS 应用
-│   ├── project.yml                 # xcodegen 生成 xcodeproj 的唯一真相源
-│   ├── Local.xcconfig.example      # 模板：DEVELOPMENT_TEAM 等签名设置
-│   └── VibeBuddy/
-│       ├── VibeBuddyApp.swift      # @main，注入 TextInjector
-│       ├── ContentView.swift       # 主窗口 UI
-│       └── TextInjector.swift      # CGEvent 增量注入 + 最长公共前缀 diff
-├── ios-app/                        # iOS / iPadOS 应用（universal）
-│   ├── project.yml                 # TARGETED_DEVICE_FAMILY=1,2
-│   ├── Local.xcconfig.example      # 模板：DEVELOPMENT_TEAM 等签名设置
-│   ├── VibeBuddy/
-│   │   ├── VibeBuddyApp.swift      # @main，构建三 tab 架构
-│   │   ├── ContentView.swift       # TabView 容器
-│   │   ├── TranscriptTabView.swift # 转写 tab（剪贴板模式）
-│   │   ├── SettingsTabView.swift   # 凭证 + 书签管理
-│   │   ├── TextRouter.swift        # 在 PasteboardHandler / WebViewInjector 间路由
-│   │   ├── PasteboardHandler.swift # UIPasteboard + 应用内 buffer
-│   │   └── WebView/
-│   │       ├── BrowserState.swift  # @Observable，持有 iOS 26 WebPage
-│   │       ├── BrowserTabView.swift# 浏览器 tab UI（地址栏 / 工具栏 / 状态条）
-│   │       ├── BookmarkStore.swift # 书签持久化
-│   │       ├── InjectionScript.swift  # 焦点跟踪 / 增量注入 / 键盘抑制 JS
-│   │       └── WebViewInjector.swift  # 通过 WebPage.callJavaScript 应用 diff
-│   └── VibeBuddyTests/             # 单元测试基线（~80 用例）
-├── tools/
-│   ├── ble_audio_dump.py           # 纯 BLE 端到端验证脚本（bleak 客户端）
-│   ├── fw_capture.py               # 可后台的串口录制（fw-monitor 需要 TTY，用不了）
-│   └── verify_ogg_mux.py           # 真 Opus 包 → 我们的 muxer → ffmpeg 解码
+│   ├── sdkconfig.defaults   # IDF 配置唯一来源（电源管理、BT、栈大小、MAC 数量）
+│   └── src/                 # main.cpp（主循环/屏幕/电源）· ble_bridge（NUS）· recorder（录音+Opus）
+├── shared/                  # VibeBuddyCore（Swift Package）：BLE / PTT / 音频 / ASR 业务逻辑
+├── macos-app/               # macOS：CGEvent 注入、FocusGate、全局热键
+├── ios-app/                 # iOS / iPadOS：转写 tab（剪贴板）+ 浏览器 tab（WebView 注入）
+├── tools/                   # BLE 抓包、串口录制、Ogg 封装验证、AX 探测、图标生成
 └── docs/
-    └── hardware-debug.md           # 硬件调试流程 / 崩溃诊断 / 症状伪装对照表
+    ├── hardware-debug.md    # 真机调试流程、症状伪装对照表、功耗测量
+    └── doubao-asr-offical-doc.md
 ```
+
+各模块的关键文件和职责见 [CLAUDE.md](CLAUDE.md)「架构骨架」。
 
 ## 硬件
 
 **M5Stack StickS3**（SKU K150）
-- ESP32-S3-PICO-1-N8R8（8 MB flash + 8 MB OPI PSRAM，**PSRAM 我们不启用**——唯一想用它的是 32 KB 音频环形缓冲，而内部 RAM 只用了 17%，装得下它 8 倍；八线 PSRAM 要常供电常时钟，为这点东西开它不划算）
+- ESP32-S3-PICO-1-N8R8（8 MB flash + 8 MB OPI PSRAM，**PSRAM 我们不启用**——唯一想用它的是 32 KB 音频环形缓冲，内部 RAM 绰绰有余；八线 PSRAM 要常供电常时钟，会削弱 light sleep）
 - 1.14" LCD · MEMS mic 经 ES8311 codec · BMI270 · AXP2101 PMU
 - BLE 5.0（支持 2M PHY + DLE）
 
@@ -130,7 +95,7 @@ iOS 端凭证目前走 `UserDefaults`（后续会迁到 Keychain），首次启�
 
 | 端 | 最低版本 | 说明 |
 |---|---|---|
-| 固件 | — | M5Stack StickS3，PlatformIO @6.12.0+ |
+| 固件 | — | M5Stack StickS3，PlatformIO `espressif32@6.12.0`（ESP-IDF 4.4；首次构建要从源码编 IDF，几分钟） |
 | macOS App | macOS 14（Sonoma） | CoreBluetooth + Accessibility |
 | iOS App | **iOS 26 / iPadOS 26** | 依赖 SwiftUI 原生 `WebView` / `WebPage` API |
 
@@ -158,10 +123,10 @@ make clean
 
 ```bash
 make fw-upload      # 编译 + 烧录
-make fw-monitor     # 串口日志（115200，标签：[boot] [ble] [link] [rec] [mic] [tick]）
+make fw-monitor     # 串口日志（115200，标签：[boot] [ble] [rec] [btn] [pm] [pwr] [tick]）
 ```
 
-连接设备：USB-C 数据线连 Mac。首次烧录如找不到串口，`ls /dev/cu.*` 看设备名。
+连接设备：USB-C 数据线连 Mac。插线后找不到串口（`ls /dev/cu.usbmodem*`），见 [hardware-debug.md](docs/hardware-debug.md)「插着 USB 却没有串口」。
 
 ### macOS App
 
@@ -255,7 +220,7 @@ make fw-capture ARGS="--reset --seconds 10"  # 复位后录，抓 [boot] / 崩�
 
 `make fw-monitor` 需要 TTY，后台跑或重定向会直接抛 traceback——要挂着录就用 `fw-capture`。
 
-关键标签：`[boot]` / `[ble]` / `[link]` / `[rec]` / `[mic]` / `[tick]` / `[pwr]`
+关键标签：`[boot]` / `[ble]` / `[rec]` / `[btn]` / `[pm]` / `[pwr]` / `[tick]`
 
 **`[tick]` 是判断设备有没有崩过的关键**：它每秒 +1，从 boot 起算。烧录十几分钟后 tick 却只有十几 = 刚重启过。
 
@@ -285,7 +250,7 @@ iOS 端关键标签：`[ble]` / `[stt]` / `[wv]`（WebView 注入）。模拟器
 - **广播名**：`VibeBuddy-XXXX`（XXXX = BT MAC 后 4 位十六进制）
 - **设备配对**：应用层白名单，不是 BLE bonding（链路仍是明文，加密见 Phase 2）。白名单存 `XXXX` 后缀——它源自 BT MAC，跨主机稳定，跟机身屏幕上显示的一致。macOS 存 `~/.config/vibe-buddy/devices.json`，iOS 存 `UserDefaults`。**白名单为空 = 连第一个搜索到的设备**（保持老行为，升级不会断连）；非空则只连白名单内的。配对界面在 macOS `设置 → 设备` / iOS `设置 → 蓝牙设备`
 - **帧分派**：JSON 文本帧以 `\n` 结束；音频二进制帧以魔数 `0xFF 0xAA` 起头，后跟 `seq[2B LE]` + `len[2B LE]` + payload
-- **音频编码**：设备端 Opus（CBR 20kbps，60ms/帧 = 960 样本，VOIP 模式，complexity 1，DTX 关）。一帧 = 一个 Opus 包 = 一个 notify，约 150B + 6B 头，**~2.8 KB/s**（裸 PCM 是 32 KB/s）。主机**全程不解码**：`OggOpusMuxer` 封成 Ogg 直接喂豆包（`format:ogg, codec:opus`）。编解码器在 `{"type":"audio","event":"start",...,"codec":"opus"}` 里声明；**字段缺失 = PCM**，所以旧固件配新 App 仍然能用
+- **音频编码**：设备端 Opus（CBR 20kbps，60ms/帧 = 960 样本，VOIP 模式，complexity 1，DTX 关）。一帧 = 一个 Opus 包 = 一个 notify，约 150B + 6B 头，**~2.6 KB/s**（裸 PCM 是 32 KB/s）。主机**全程不解码**：`OggOpusMuxer` 封成 Ogg 直接喂豆包（`format:ogg, codec:opus`）。编解码器在 `{"type":"audio","event":"start",...,"codec":"opus"}` 里声明；**字段缺失 = PCM**，所以旧固件配新 App 仍然能用
 - **链路协商**：连接建立后固件请求 2M PHY + MTU 517（notify payload 上限 500 B）+ DLE 251 + conn interval 15ms / peripheral latency 30。协商结果随 **1Hz 心跳**上报：`{"type":"hb","seq":N,"btn_a":bool,"phy":"2M","mtu":517}`。**不用一次性通知**——曾经有个 `{"type":"link"}` 帧在 PHY 就绪时立刻发一次，但那时 CoreBluetooth 还没走完 `setNotifyValue()`，notify 被静默丢弃且无重传，约 50% 的概率让 UI 永远卡在 `? PHY / MTU 20`。值得持续显示的事实不该用「发完即忘」的消息传递
 - **采样率**：固定 16 kHz，无降级档。通过 `{"type":"audio","event":"start","sample_rate":N,"codec":"opus"}` 告知 Mac
 - **2M PHY 是优化，不是要求**：每次连接都请求 2M（空中时间减半，免费），但拿不到就用 1M——Opus 只要 ~20 kbps，1M 绰绰有余。裸 PCM 时代 2M 是硬性前提（拿不到就拒绝录音），Opus 之后那个硬性要求只剩下「在不支持 2M 的主机上把设备变砖」这一个作用，已去掉。**现在真正制约录音的是 MTU**：一帧 Opus 必须装进一个 notify，所以 `recorderStart()` 检查 `MTU ≥ 159`（6 字节头 + 150 字节 CBR 包 + 3 字节 ATT 开销），不够就拒绝并在屏幕上标红
@@ -303,7 +268,13 @@ iOS 端关键标签：`[ble]` / `[stt]` / `[wv]`（WebView 注入）。模拟器
 
 向后兼容：`codec` 是 `audio/start` JSON 的**新增字段，缺失即 PCM**，所以旧固件配新 App 照常工作。
 
-**硬约束（实测，别破）**：一帧 60 ms 音频编码要 **19–22 ms**（240 MHz / complexity 1），占实时预算三分之一，且随内容波动。因此录音全程必须锁 240 MHz（`main.cpp` 的 DFS 按 `recorderActive()` 拉满，80 MHz 下要 ~66 ms 直接超预算），且 complexity 不能上调。破了会让编码慢于实时，`recorder.cpp` 的 `MAX_ENCODES_PER_TICK = 4` 是最后一道闸。细节见 [docs/hardware-debug.md](docs/hardware-debug.md)。
+**硬约束（实测，别破）**：一帧 60 ms 音频编码要 **19–22 ms**（240 MHz / complexity 1），占实时预算三分之一，且随内容波动。因此录音全程必须锁 240 MHz（`main.cpp` 的 `cpuLock` 在录音时持有，80 MHz 下要 ~66 ms 直接超预算），且 complexity 不能上调。破了会让编码慢于实时，`recorder.cpp` 的 `MAX_ENCODES_PER_TICK = 4` 是最后一道闸。细节见 [docs/hardware-debug.md](docs/hardware-debug.md)。
+
+### 电源管理：靠 light sleep，靠锁表达需求
+
+固件打开了 ESP-IDF 电源管理（`sdkconfig.defaults`）：没有任何 esp_pm 锁时自动 light sleep，BLE 射频在连接事件间断电。代码不直接调频，只用两把锁表达需求（`main.cpp` 的 `updatePowerLocks()`）：录音或屏幕全亮持有 `cpuLock`（240 MHz，同时阻止睡眠），背光亮或插着 USB 持有 `awakeLock`。
+
+锁全放开只是「允许睡」，能不能真睡着取决于唤醒频率。熄屏空闲时的唤醒源都被收住了：录音任务阻塞等通知、BLE 用 peripheral latency 跳过空闲连接事件、主循环靠按键中断唤醒（`idleWait()`）。新增任何周期性唤醒都会把 light sleep 切碎——改完看 `[pwr]` 的 `slp=` / `wk=`，判读方法见 [hardware-debug.md](docs/hardware-debug.md)「功耗测量」。
 
 ### 几处踩坑经验
 
@@ -319,11 +290,10 @@ iOS 端关键标签：`[ble]` / `[stt]` / `[wv]`（WebView 注入）。模拟器
 
 ## 路线图
 
-Phase 1（已完成）：按住录音 → 流式 ASR → 增量注入，端到端走通；iOS 浏览器 tab + 三 tab 架构；固件电量进度条；iOS 26 SwiftUI WebView 迁移；浏览器键盘抑制 toggle。
+Phase 1（已完成）：按住录音 → 流式 ASR → 增量注入，端到端走通；iOS 浏览器 tab + 三 tab 架构；固件电量进度条；iOS 26 SwiftUI WebView 迁移；浏览器键盘抑制 toggle；设备端编辑键（A 单击换行、B 单击退格 / 长按清空）；空闲 light sleep。
 
 Phase 2（计划中）：
 - Claude 权限申请的硬件审批流
-- 文字编辑辅助模式（双击换行、BtnB backspace）
 - BLE 加密配对
 - 屏幕菜单与设置页
 - iOS Keychain 凭证管理

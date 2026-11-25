@@ -80,14 +80,6 @@ sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db \
 # auth_value: 0=拒绝 2=允许
 ```
 
-### 插着 USB 却没有串口（设备睡着时插的线）
-
-USB 枚举由 USB Serial/JTAG 硬件完成，light sleep 时它停摆。熄屏睡眠中插线，
-主机的复位没人应答，主机放弃后不再重试——`/dev/cu.usbmodem*` 不出现，
-`make fw-upload` 一直等。固件在检测到 VBUS 后会拉低 D+ 一下逼主机重新枚举
-（`main.cpp` 的 `usbReenumerate()`），正常应在 10 s 内出现串口。没出现时：
-按一下按键亮屏，再拔插一次。
-
 ### 正确姿势：`open --stderr`
 
 保留 App 自己的 TCC 归属，同时拿到 stderr：
@@ -98,6 +90,14 @@ open --stdout /tmp/vb.txt --stderr /tmp/vb.txt \
 ```
 
 不用改任何系统权限。
+
+### 插着 USB 却没有串口（设备睡着时插的线）
+
+USB 枚举由 USB Serial/JTAG 硬件完成，light sleep 时它停摆。熄屏睡眠中插线，
+主机的复位没人应答，主机放弃后不再重试——`/dev/cu.usbmodem*` 不出现，
+`make fw-upload` 一直等。固件在检测到 VBUS 后会拉低 D+ 一下逼主机重新枚举
+（`main.cpp` 的 `usbReenumerate()`），正常应在 10 s 内出现串口。没出现时：
+按一下按键亮屏，再拔插一次。
 
 ---
 
@@ -138,7 +138,7 @@ make fw-capture ARGS="--reset --seconds 10 --echo"
 | `[ble] disconnected: The connection has timed out unexpectedly.`，距会话开始正好 ~4 秒 | **设备崩溃重启**（崩溃不发 disconnect PDU，主机只能等 supervision timeout） | 串口找 `Backtrace` / `rst:0x` |
 | `bytes=0` / `flushing 0 pre-buffered bytes` | 设备一个音频包都没发出来 | 串口看 `[rec] start` 之后有没有 `[rec] stopped` |
 | 链路显示 `? PHY · MTU 20` | 刚重连、还没协商完 | 设备是不是刚重启 |
-| 音频中途卡住但链路不断 | 主循环被卡（`recorderTick` 无界循环之类），BLE 协议栈同核饿死 | 串口 `[tick]` 停止递增 |
+| 音频中途卡住但链路不断 | 主循环被卡（`recorderTick` 无界循环之类）。BLE 协议栈在 core 0、`loop()` 在 core 1，所以链路还在，只是帧和心跳都停了 | 串口 `[tick]` 停止递增，约 5 秒后出现 `task_wdt` 报 `IDLE (CPU 1)`（只告警不复位） |
 
 ### 判断设备是否重启过：看 `[tick]`
 
@@ -186,9 +186,9 @@ afplay out.ogg
 | 固件 | `[boot]` | 启动。出现 = 重启过 |
 | | `[rec]` | 录音会话。`start` / `stopped: frames=.. enc=..us` |
 | | `[btn]` | 按键。屏幕全黑时首次按下只唤醒屏幕（`aWakeOnly`），要按第二次才录音 |
-| | `[link]` | `ready: phy=2M mtu=517` = 协商完成 |
 | | `[tick]` | 1 Hz 心跳，**判断重启的关键** |
-| | `[pwr]` | mV/min 功耗代理（AXP2101 没有电流 ADC） |
+| | `[pm]` | 电源锁的获取/释放、启动时的 PM 配置、USB 插入重枚举 |
+| | `[pwr]` | 1 Hz：电压、mV/min、背光、`pmcpu`/`pmawake` 锁状态、`slp`/`wk` 实测睡眠（同一行也经 BLE 发到 App） |
 | App | `[ble]` | 扫描 / 连接 / 断开 |
 | | `[audio]` | 会话、trim、gap |
 | | `[stt]` | 豆包 WebSocket、partial、FINAL |
@@ -227,10 +227,10 @@ App:  [json] {"type":"audio","event":"start","sample_rate":16000,"codec":"opus"}
 
 由此两条依赖是硬的，破了就会「编码慢于实时」：
 
-1. **录音全程必须锁 240 MHz。** `main.cpp` 的 DFS 按 `recorderActive()` 拉满，目前成立。但 80 MHz 下同样一帧要 ~66 ms，**直接超出 60 ms 预算**。
+1. **录音全程必须锁 240 MHz。** `main.cpp` 的 `cpuLock` 在录音时持有，目前成立。但 80 MHz 下同样一帧要 ~66 ms，**直接超出 60 ms 预算**。
 2. **`OPUS_SET_COMPLEXITY` 不能往上调。**
 
-`recorder.cpp` 的 `MAX_ENCODES_PER_TICK = 4` 是最后一道闸：没有它，编码一旦慢于实时，`while (ringAvail() >= 960)` 永远为真 → `loop()` 永不返回 → 同核 BLE 饿死 → 主机看到「4 秒超时断连」，且**没有崩溃日志可查**。
+`recorder.cpp` 的 `MAX_ENCODES_PER_TICK = 4` 是最后一道闸：没有它，编码一旦慢于实时，`while (ringAvail() >= 960)` 永远为真 → `loop()` 永不返回 → 音频帧和心跳全停。不会崩溃重启，串口只有 `task_wdt` 告警。
 
 改动 codec 参数或调频策略后，回来看 `enc=` 这个数。
 

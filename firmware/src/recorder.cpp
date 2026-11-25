@@ -61,8 +61,8 @@ static constexpr uint16_t MIN_MTU_FOR_OPUS = 6 + OPUS_CBR_PACKET + 3;
 // Two implicit dependencies fall out of that, so they're written down
 // here rather than rediscovered the hard way:
 //
-//  1. CPU stays at 240 MHz for the whole session. main.cpp's DFS keys on
-//     recorderActive(), so this holds today — but at 80 MHz the same
+//  1. CPU stays at 240 MHz for the whole session. main.cpp holds cpuLock
+//     while recorderActive(), so this holds today — but at 80 MHz the same
 //     frame would cost ~66 ms and blow the 60 ms budget outright.
 //  2. OPUS_SET_COMPLEXITY stays low. Raising it eats the margin directly.
 //
@@ -340,8 +340,8 @@ void recorderInit() {
   // baseline current draw; we accept the ~50 ms warm-up cost on the
   // first press of each session in exchange.
   //
-  // Core 0 runs Arduino loop + BLE stack; put the mic reader on core 1
-  // so audio DMA handling never stalls behind BLE notify bookkeeping.
+  // The BLE stack runs on core 0; the mic reader goes on core 1 (alongside
+  // Arduino's loop) so audio DMA handling never stalls behind BLE bookkeeping.
   // The task is started here even though the mic isn't up yet — it
   // blocks in the !active branch until notified.
   xTaskCreatePinnedToCore(recorderTask, "recorder", 4096, nullptr, 5, &recorderTaskHandle, 1);

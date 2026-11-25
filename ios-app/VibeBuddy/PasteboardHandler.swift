@@ -55,7 +55,7 @@ final class PasteboardHandler: ObservableObject, TextHandler {
     // MARK: hardware-button edit actions
 
     func sendEnter() {
-        // BtnA double-tap on macOS dispatches Return. On iOS we treat
+        // BtnA click on macOS dispatches Return. On iOS we treat
         // this as "commit the current line into the log and start
         // fresh." The pasteboard keeps the joined view so a single
         // paste produces the full conversation.

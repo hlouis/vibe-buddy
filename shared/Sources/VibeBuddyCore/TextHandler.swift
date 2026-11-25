@@ -29,7 +29,7 @@ public protocol TextHandler: AnyObject {
     func reset()
 
     // Hardware-button edit actions originating on the device:
-    //   • sendEnter:         BtnA double-tap, "newline" semantics
+    //   • sendEnter:         BtnA click, "newline" semantics
     //   • sendBackspaceChar: BtnB short-press, delete one character
     //   • clearAll:          long-press, wipe the focused field
     //   • rollback:          session cancelled mid-flight, undo whatever
