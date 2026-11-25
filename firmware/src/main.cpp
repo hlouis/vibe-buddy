@@ -2,6 +2,9 @@
 #include <esp_mac.h>
 #include <esp_pm.h>
 #include <esp_timer.h>
+#include <driver/gpio.h>
+#include <esp_sleep.h>
+#include <hal/gpio_ll.h>
 #include <stdarg.h>
 #include "ble_bridge.h"
 #include "recorder.h"
@@ -518,6 +521,64 @@ static void sendEditAction(const char* action) {
   Serial.printf("[edit] %s\n", action);
 }
 
+// Screen-off idle wait. Instead of polling buttons on a timer, the loop
+// blocks until a button is pressed or the next 1 s tick (power log,
+// heartbeat) is due, so an idle device wakes about once a second.
+//
+// The buttons (BtnA = GPIO11, BtnB = GPIO12, active low; see M5Unified)
+// serve both as the light-sleep wake source and as the interrupt that
+// notifies this task. Light-sleep GPIO wake only supports level triggers
+// and shares the pin's interrupt-type field, so the interrupt is
+// level-triggered too; the ISR disables itself on first fire, or a held
+// button would re-enter it endlessly. Armed only for the wait, and only
+// while both buttons are released.
+static constexpr gpio_num_t BTN_A_PIN = GPIO_NUM_11;
+static constexpr gpio_num_t BTN_B_PIN = GPIO_NUM_12;
+static TaskHandle_t loopTaskHandle = nullptr;
+
+static void IRAM_ATTR buttonIsr(void* arg) {
+  gpio_ll_intr_disable(&GPIO, (gpio_num_t)(intptr_t)arg);
+  BaseType_t woken = pdFALSE;
+  vTaskNotifyGiveFromISR(loopTaskHandle, &woken);
+  if (woken) portYIELD_FROM_ISR();
+}
+
+static void initButtonWake() {
+  loopTaskHandle = xTaskGetCurrentTaskHandle();   // setup() runs on loopTask
+  gpio_install_isr_service(0);                    // INVALID_STATE if already installed: fine
+  for (gpio_num_t pin : {BTN_A_PIN, BTN_B_PIN}) {
+    gpio_intr_disable(pin);
+    gpio_isr_handler_add(pin, buttonIsr, (void*)(intptr_t)pin);
+  }
+  esp_sleep_enable_gpio_wakeup();
+}
+
+static void idleWait() {
+  uint32_t now = millis();
+  uint32_t due = min(lastPowerLog, lastHeartbeat) + 1000;
+  uint32_t waitMs = ((int32_t)(due - now) > 0) ? (due - now) : 1;
+  if (waitMs > 1000) waitMs = 1000;
+
+  // A button still held (e.g. pressed past the screen-off timeout) would
+  // fire the level interrupt immediately; poll at 50 ms until released.
+  bool released = gpio_get_level(BTN_A_PIN) && gpio_get_level(BTN_B_PIN);
+  if (released) {
+    for (gpio_num_t pin : {BTN_A_PIN, BTN_B_PIN}) {
+      gpio_wakeup_enable(pin, GPIO_INTR_LOW_LEVEL);
+      gpio_intr_enable(pin);
+    }
+  } else if (waitMs > 50) {
+    waitMs = 50;
+  }
+  ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(waitMs));
+  if (released) {
+    for (gpio_num_t pin : {BTN_A_PIN, BTN_B_PIN}) {
+      gpio_intr_disable(pin);
+      gpio_wakeup_disable(pin);
+    }
+  }
+}
+
 void setup() {
   auto cfg = M5.config();
   // StickS3 routes both speaker and mic through the ES8311 codec on a
@@ -546,6 +607,7 @@ void setup() {
   bleInit(deviceName);
   recorderInit();
 
+  initButtonWake();
   drawScreen();
 }
 
@@ -787,17 +849,13 @@ void loop() {
   // the old behavior stands, warm for DIM_AFTER_MS after real activity.
   recorderSetMicWarm(bleLinkReady() && currentBrightness == BRIGHT_FULL);
 
-  // How long we yield here decides whether light sleep can happen even
-  // with no lock held. Tickless idle sleeps only if the next task wake-up
-  // is at least CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP ticks (3 ms) away,
-  // so delay(2) can never sleep.
-  //
   // 2 ms while recording (recorderTick drains the ring in one call, the
   // audio path wants the tight cadence) and while the screen is lit: a
   // lit-screen BtnA press starts recording directly, and polling latency
-  // there would cut the start of the utterance. 50 ms once the screen is
-  // off: buttons are polled, and the first press on a dark screen only
-  // wakes it, so the extra latency costs nothing.
+  // there would cut the start of the utterance. delay(2) never light-sleeps
+  // (tickless idle needs the next wake >= 3 ms away), which is fine here:
+  // a lit screen holds awakeLock anyway. Screen off: idleWait().
   bool busy = recorderActive() || currentBrightness != BRIGHT_OFF;
-  delay(busy ? 2 : 50);
+  if (busy) delay(2);
+  else      idleWait();
 }

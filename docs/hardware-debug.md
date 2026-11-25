@@ -269,8 +269,10 @@ esp_pm 给每个核建了一把内部 `CPU_FREQ_MAX` 锁（`pm_impl.c` 里的
 `--wrap=esp_light_sleep_start`）：`slp` = 上一秒实际 light sleep 占比，
 `wk` = 进入次数。这两个数随 BLE 日志到达主机，拔线后也能看。
 
-`wk` 是找唤醒源的线索：≈67/s 对应每个 15 ms 连接事件都醒（peripheral
-latency 没生效），≈20/s 对应主循环 50 ms 轮询。
+`wk` 是找唤醒源的线索。熄屏空闲的健康值是个位数每秒（主循环约 1 次，
+按键靠中断唤醒；BLE 靠 peripheral latency 跳过空闲连接事件），`slp` 在
+85–90%。≈67/s 说明每个 15 ms 连接事件都在醒（latency 没生效）；≈20/s
+说明主循环退回了 50 ms 轮询（`idleWait()` 没走到，或有按键被判为按住）。
 
 ### 手指仍是最终判据
 
