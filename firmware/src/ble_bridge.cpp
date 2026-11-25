@@ -76,21 +76,30 @@ class ServerCallbacks : public BLEServerCallbacks {
     esp_err_t d = esp_ble_gap_set_pkt_data_len(peerAddr, 251);
     Serial.printf("[ble] set_pkt_data_len(251) -> %d\n", (int)d);
 
-    // Ask iOS for a tight connection interval. iOS picks 15-30ms by
-    // default; audio needs events frequent enough to drain notify queue.
-    // 0x06 * 1.25ms = 7.5ms min, 0x0C * 1.25ms = 15ms max.
-    // (Tried idle/recording switching for power savings — Mac negotiates
-    // param updates asynchronously over multiple seconds, so audio
-    // sessions started while still on relaxed params drop frames. The
-    // BLE-radio savings weren't worth the audio regression.)
+    // Connection parameters: a fixed 15 ms interval plus peripheral
+    // latency 30.
+    //
+    // 15 ms keeps events frequent enough to drain the audio notify queue
+    // and is the tightest interval Apple's accessory guidelines allow
+    // (min == max == 15 ms is the permitted exception to "min + 15 <= max").
+    //
+    // Latency is what makes idle cheap: with nothing to send, the
+    // peripheral may skip up to 30 events, so an idle device wakes for
+    // BLE a few times a second instead of ~67. It costs recording
+    // nothing — the peripheral transmits at the very next event whenever
+    // it has data, and no renegotiation is involved. Host-to-device
+    // messages (front_app) may wait up to 15 ms * 31 = 465 ms.
+    //
+    // Apple limits: latency <= 30, interval * (latency + 1) <= 2 s, and
+    // timeout > 3 * interval * (latency + 1) = 1.4 s; 4 s satisfies it.
     esp_ble_conn_update_params_t cp = {};
     memcpy(cp.bda, peerAddr, sizeof(esp_bd_addr_t));
-    cp.min_int = 0x06;
+    cp.min_int = 0x0C;  // 12 * 1.25 ms = 15 ms
     cp.max_int = 0x0C;
-    cp.latency = 0;
+    cp.latency = 30;
     cp.timeout = 400;   // 4 s supervision timeout
     esp_err_t c = esp_ble_gap_update_conn_params(&cp);
-    Serial.printf("[ble] update_conn_params 7.5-15ms -> %d\n", (int)c);
+    Serial.printf("[ble] update_conn_params 15ms lat=30 -> %d\n", (int)c);
   }
   void onDisconnect(BLEServer*) override {
     connected = false;
