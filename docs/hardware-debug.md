@@ -80,6 +80,14 @@ sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db \
 # auth_value: 0=拒绝 2=允许
 ```
 
+### 插着 USB 却没有串口（设备睡着时插的线）
+
+USB 枚举由 USB Serial/JTAG 硬件完成，light sleep 时它停摆。熄屏睡眠中插线，
+主机的复位没人应答，主机放弃后不再重试——`/dev/cu.usbmodem*` 不出现，
+`make fw-upload` 一直等。固件在检测到 VBUS 后会拉低 D+ 一下逼主机重新枚举
+（`main.cpp` 的 `usbReenumerate()`），正常应在 10 s 内出现串口。没出现时：
+按一下按键亮屏，再拔插一次。
+
 ### 正确姿势：`open --stderr`
 
 保留 App 自己的 TCC 归属，同时拿到 stderr：

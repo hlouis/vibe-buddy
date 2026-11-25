@@ -5,6 +5,7 @@
 #include <driver/gpio.h>
 #include <esp_sleep.h>
 #include <hal/gpio_ll.h>
+#include <soc/usb_serial_jtag_struct.h>
 #include <stdarg.h>
 #include "ble_bridge.h"
 #include "recorder.h"
@@ -194,6 +195,21 @@ static void initPowerManagement() {
   // Take it here, not on the first updatePowerLocks() in loop(): BLE init
   // and radio calibration in between are long enough to idle into sleep.
   holdLock(awakeLock, awakeLockHeld, wantAwake(), "awake");
+}
+
+// USB enumeration is done by the USB Serial/JTAG hardware, which light
+// sleep stops. A cable plugged in while asleep misses the host's reset,
+// the host gives up, and no serial port ever appears — even after we wake
+// for VBUS. So on attach, once awakeLock is held, drop the D+ pull-up
+// briefly: the host sees a disconnect/connect and enumerates while we're
+// awake.
+static void usbReenumerate() {
+  USB_SERIAL_JTAG.conf0.dp_pullup = 0;
+  USB_SERIAL_JTAG.conf0.pad_pull_override = 1;
+  delay(20);
+  USB_SERIAL_JTAG.conf0.dp_pullup = 1;
+  USB_SERIAL_JTAG.conf0.pad_pull_override = 0;
+  Serial.println("[pm] usb attach -> re-enumerate");
 }
 
 static void updatePowerLocks() {
@@ -738,7 +754,13 @@ void loop() {
     // -1 means the model doesn't support it, in which case fall back to
     // isCharging() and accept the flapping rather than never dimming.
     int16_t vbus = M5.Power.getVBUSVoltage();
-    g_usbPowered = (vbus < 0) ? g_charging : (vbus > 4000);
+    bool usb = (vbus < 0) ? g_charging : (vbus > 4000);
+    bool attached = usb && !g_usbPowered;
+    g_usbPowered = usb;
+    if (attached) {
+      updatePowerLocks();   // hold awakeLock before re-enumerating
+      usbReenumerate();
+    }
     // StickS3 has no fuel gauge — M5Unified estimates SOC linearly from
     // mV (3300→0%, 4100→100%). During Li-Po CV charging, voltage holds
     // near 4.1V for the bulk of the charge, so level can read 100% for
