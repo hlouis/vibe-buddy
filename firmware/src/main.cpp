@@ -1,6 +1,7 @@
 #include <M5Unified.h>
 #include <esp_mac.h>
 #include <esp_pm.h>
+#include <esp_timer.h>
 #include <stdarg.h>
 #include "ble_bridge.h"
 #include "recorder.h"
@@ -135,6 +136,24 @@ static esp_pm_lock_handle_t cpuLock = nullptr;
 static esp_pm_lock_handle_t awakeLock = nullptr;
 static bool cpuLockHeld = false;
 static bool awakeLockHeld = false;
+
+// Ground truth for "is it actually sleeping". Lock state only says sleep
+// is *allowed*; tickless idle still skips it whenever the next wake-up is
+// under 3 ms away. platformio.ini links with --wrap=esp_light_sleep_start
+// so every real light-sleep entry lands here. Called from vApplicationSleep
+// inside the PM spinlock, hence IRAM and no locking of our own. uint32 µs
+// wraps after ~71 min; the 1 s deltas in loop() are wrap-safe.
+static volatile uint32_t g_sleepUs = 0;
+static volatile uint32_t g_sleepCount = 0;
+
+extern "C" esp_err_t __real_esp_light_sleep_start(void);
+extern "C" esp_err_t IRAM_ATTR __wrap_esp_light_sleep_start(void) {
+  int64_t t0 = esp_timer_get_time();
+  esp_err_t e = __real_esp_light_sleep_start();
+  g_sleepUs += (uint32_t)(esp_timer_get_time() - t0);
+  g_sleepCount++;
+  return e;
+}
 
 static void holdLock(esp_pm_lock_handle_t h, bool& held, bool want, const char* tag) {
   if (!h || want == held) return;
@@ -613,6 +632,12 @@ void loop() {
   // host. The slope is our proxy for current draw on this PMIC.
   if (lastPowerLog == 0 || now - lastPowerLog >= POWER_LOG_MS) {
     lastPowerLog = now;
+    static uint32_t prevWallUs = 0, prevSleepUs = 0, prevSleepCount = 0;
+    uint32_t wallUs = (uint32_t)esp_timer_get_time();
+    uint32_t sleepUs = g_sleepUs, sleepCount = g_sleepCount;
+    unsigned slpPct = (wallUs - prevWallUs) ? (unsigned)((uint64_t)(sleepUs - prevSleepUs) * 100 / (wallUs - prevWallUs)) : 0;
+    unsigned wakes = sleepCount - prevSleepCount;
+    prevWallUs = wallUs; prevSleepUs = sleepUs; prevSleepCount = sleepCount;
     g_mv = (int)M5.Power.getBatteryVoltage();
     slopeMv[slopeIdx] = g_mv;
     slopeMs[slopeIdx] = now;
@@ -620,23 +645,24 @@ void loop() {
     if (slopeIdx == 0) slopeFull = true;
     g_mvPerMin = computeMvPerMin();
     drawPowerHud();
-    // pmcpu/pmawake = which of our esp_pm locks are held. The actual CPU
-    // clock is not logged: read from a task it always reports max (see
-    // docs/hardware-debug.md).
-    Serial.printf("[pwr] mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u pmcpu=%d pmawake=%d\n",
+    // pmcpu/pmawake = which of our esp_pm locks are held; slp = % of the
+    // last interval spent in light sleep, wk = light-sleep entries in it.
+    // The CPU clock is not logged: read from a task it always reports max
+    // (see docs/hardware-debug.md).
+    Serial.printf("[pwr] mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u pmcpu=%d pmawake=%d slp=%u wk=%u\n",
                   g_mv, g_mvPerMin,
                   bleConnected() ? 1 : 0,
                   recorderActive() ? 1 : 0,
                   btnAHeld ? 1 : 0,
                   (unsigned)currentBrightness,
-                  cpuLockHeld ? 1 : 0, awakeLockHeld ? 1 : 0);
-    bleLogf("mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u pmcpu=%d pmawake=%d",
+                  cpuLockHeld ? 1 : 0, awakeLockHeld ? 1 : 0, slpPct, wakes);
+    bleLogf("mv=%d mv_per_min=%d conn=%d rec=%d btnA=%d bl=%u pmcpu=%d pmawake=%d slp=%u wk=%u",
             g_mv, g_mvPerMin,
             bleConnected() ? 1 : 0,
             recorderActive() ? 1 : 0,
             btnAHeld ? 1 : 0,
             (unsigned)currentBrightness,
-            cpuLockHeld ? 1 : 0, awakeLockHeld ? 1 : 0);
+            cpuLockHeld ? 1 : 0, awakeLockHeld ? 1 : 0, slpPct, wakes);
   }
 
   if (lastBatteryPoll == 0 || now - lastBatteryPoll >= BATTERY_POLL_MS) {
