@@ -111,6 +111,21 @@ static volatile uint32_t encodeUs = 0;
 static volatile bool micUp = false;
 static volatile bool micShutdownPending = false;
 
+// The recorder task blocks on a task notification while idle instead of
+// polling, so an idle device has no periodic wake-up from here (any
+// periodic wake fragments light sleep). Everything the idle branch acts
+// on — a session starting, a pending codec shutdown — notifies it.
+static TaskHandle_t recorderTaskHandle = nullptr;
+
+static void wakeRecorderTask() {
+  if (recorderTaskHandle) xTaskNotifyGive(recorderTaskHandle);
+}
+
+static void requestMicShutdown() {
+  micShutdownPending = true;
+  wakeRecorderTask();
+}
+
 // Opus encoder. Created once at init and reset per session rather than
 // created/destroyed per press: opus_encoder_create for 16 kHz mono is a
 // ~20 KB allocation, and doing that on the PTT press edge would add
@@ -231,7 +246,7 @@ static void recorderTask(void*) {
         micShutdownPending = false;
         Serial.println("[rec] mic down");
       }
-      vTaskDelay(pdMS_TO_TICKS(5));
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
       continue;
     }
 
@@ -328,8 +343,8 @@ void recorderInit() {
   // Core 0 runs Arduino loop + BLE stack; put the mic reader on core 1
   // so audio DMA handling never stalls behind BLE notify bookkeeping.
   // The task is started here even though the mic isn't up yet — it
-  // sits in the !active branch doing vTaskDelay until needed.
-  xTaskCreatePinnedToCore(recorderTask, "recorder", 4096, nullptr, 5, nullptr, 1);
+  // blocks in the !active branch until notified.
+  xTaskCreatePinnedToCore(recorderTask, "recorder", 4096, nullptr, 5, &recorderTaskHandle, 1);
 }
 
 void recorderStart() {
@@ -364,7 +379,7 @@ void recorderStart() {
   }
   if (!opusBringUp()) {
     Serial.println("[rec] start aborted: opus encoder unavailable");
-    micShutdownPending = true;
+    requestMicShutdown();
     return;
   }
   // Fresh encoder state per session — otherwise the first packets of a
@@ -378,6 +393,7 @@ void recorderStart() {
   stopPending = false;
   startedAt = millis();
   active = true;
+  wakeRecorderTask();
 
   // "codec" is new as of the on-device Opus change. Hosts that predate
   // it ignore the key and assume PCM — which is why the field is
@@ -408,7 +424,7 @@ void recorderCancel() {
   stopPending = false;
   ringHead = ringTail = 0;
   pendingLen = 0;
-  micShutdownPending = true;   // task will end() the codec on its idle pass
+  requestMicShutdown();        // task will end() the codec on its idle pass
   const char* s = "{\"type\":\"audio\",\"event\":\"cancel\"}\n";
   bleWrite((const uint8_t*)s, strlen(s));
   Serial.printf("[rec] cancelled after frames=%u bytes=%u\n",
@@ -420,8 +436,8 @@ void recorderSetMicWarm(bool warm) {
   if (warm) {
     micShutdownPending = false;
     micBringUp();                 // idempotent
-  } else if (micUp) {
-    micShutdownPending = true;    // task will end() on next idle pass
+  } else if (micUp && !micShutdownPending) {
+    requestMicShutdown();         // task will end() on next idle pass
   }
 }
 
@@ -501,6 +517,6 @@ void recorderTick() {
                   (unsigned)encodeUs);
     // Drain done — release the codec. Recorder task will pick this up
     // on its next idle pass and call M5.Mic.end() safely.
-    micShutdownPending = true;
+    requestMicShutdown();
   }
 }
