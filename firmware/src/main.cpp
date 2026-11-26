@@ -73,24 +73,36 @@ static uint32_t lastBoltToggle = 0;
 static uint8_t  prevBattery = 255;
 static bool     prevCharging = false;
 
-// Backlight power management. The LCD + backlight is the single largest
-// idle drain on StickS3. We hold full brightness while the user is
-// active, drop to a dim "still readable" level after DIM_AFTER_MS, and
-// fully off after OFF_AFTER_MS — on USB too. StickS3 draws the system
-// load from the battery node and the charger's current is small, so a lit
-// screen at 240 MHz with a warm codec eats the whole charge current and
-// the battery stays flat while plugged in (measured: voltage falling on
-// USB with the screen on, rising with it off). Plugging in counts as
-// activity, so the screen still lights up to show the charge state.
+// Power profiles: how long after the last activity the screen dims, goes
+// off, and the device enters deep sleep (enterDeepSleep()). One profile
+// for USB power, one for battery; NEVER disables that step. Each step is
+// measured from the last activity, so they only make sense in increasing
+// order.
 //
-// "Activity" = button press, BLE connect/disconnect, or recorder start.
-// It deliberately does NOT include front_app pushes from the host: see
-// the touchActivity() call site for the measurements that killed that.
+// Keep the screen timing on USB too: StickS3 draws the system load from
+// the battery node and the charger's current is small, so a lit screen at
+// 240 MHz with a warm codec eats the whole charge current (measured:
+// voltage falling on USB with the screen on, rising with it off).
+//
+// "Activity" = button press, BLE connect/disconnect, recorder start, or
+// USB plugged/unplugged (switching profile restarts the clock). It
+// deliberately does NOT include front_app pushes from the host: see the
+// touchActivity() call site for the measurements that killed that.
+static constexpr uint32_t NEVER = UINT32_MAX;
+struct PowerProfile {
+  uint32_t dimMs;
+  uint32_t offMs;
+  uint32_t deepSleepMs;
+};
+static constexpr PowerProfile USB_PROFILE     = { 15000, 60000, NEVER };
+static constexpr PowerProfile BATTERY_PROFILE = { 15000, 60000, 10UL * 60 * 1000 };
+static const PowerProfile& powerProfile() {
+  return g_usbPowered ? USB_PROFILE : BATTERY_PROFILE;
+}
+
 static constexpr uint8_t  BRIGHT_FULL = 180;
 static constexpr uint8_t  BRIGHT_DIM  = 30;
 static constexpr uint8_t  BRIGHT_OFF  = 0;
-static constexpr uint32_t DIM_AFTER_MS = 15000;
-static constexpr uint32_t OFF_AFTER_MS = 60000;
 static uint8_t  currentBrightness = BRIGHT_FULL;
 static uint32_t lastActivityMs = 0;
 
@@ -105,8 +117,9 @@ static void applyBrightness(uint8_t target) {
 static void updateBrightness() {
   uint32_t idle = millis() - lastActivityMs;
   uint8_t target;
-  if      (idle < DIM_AFTER_MS) target = BRIGHT_FULL;
-  else if (idle < OFF_AFTER_MS) target = BRIGHT_DIM;
+  const PowerProfile& p = powerProfile();
+  if      (idle < p.dimMs) target = BRIGHT_FULL;
+  else if (idle < p.offMs) target = BRIGHT_DIM;
   else                          target = BRIGHT_OFF;
   applyBrightness(target);
 }
@@ -590,15 +603,14 @@ static void idleWait() {
 
 // Long idle -> deep sleep. Light sleep with BLE connected still costs tens
 // of mA here (the ESP32 rails and the L3B rail stay powered), so a stick
-// left on a desk overnight goes flat. After DEEP_SLEEP_AFTER_MS with the
-// screen off and no activity, power down to deep sleep; a BtnA/BtnB press
-// wakes it through a full reboot, and the host reconnects on its own.
-// Not on USB: there is nothing to save, and it would drop the console.
-static constexpr uint32_t DEEP_SLEEP_AFTER_MS = 10UL * 60 * 1000;
+// left on a desk overnight goes flat. After the profile's deepSleepMs
+// without activity, power down to deep sleep; a BtnA/BtnB press wakes it
+// through a full reboot, and the host reconnects on its own. Only buttons
+// wake it: plugging USB in does not, and deep sleep drops the console.
 
 static void enterDeepSleep() {
   Serial.println("[pm] idle -> deep sleep (BtnA/BtnB wakes)");
-  bleLogf("deep sleep: idle %u min", (unsigned)(DEEP_SLEEP_AFTER_MS / 60000));
+  bleLogf("deep sleep: idle %u s", (unsigned)(powerProfile().deepSleepMs / 1000));
   delay(50);                          // let the log notify go out
   M5.Lcd.sleep();                     // panel SLPIN
   // L3B rail (LCD, mic, speaker amp) off: M5PM1 GPIO2 low. M5GFX drives it
@@ -621,8 +633,9 @@ static void enterDeepSleep() {
 }
 
 static bool deepSleepDue() {
-  return !g_usbPowered && !recorderActive() && currentBrightness == BRIGHT_OFF &&
-         millis() - lastActivityMs >= DEEP_SLEEP_AFTER_MS &&
+  uint32_t after = powerProfile().deepSleepMs;
+  return after != NEVER && !recorderActive() &&
+         millis() - lastActivityMs >= after &&
          gpio_get_level(BTN_A_PIN) && gpio_get_level(BTN_B_PIN);
 }
 
@@ -796,9 +809,9 @@ void loop() {
     int16_t vbus = M5.Power.getVBUSVoltage();
     bool usb = (vbus < 0) ? g_charging : (vbus > 4000);
     bool attached = usb && !g_usbPowered;
+    if (usb != g_usbPowered) touchActivity();   // profile switch restarts the clock
     g_usbPowered = usb;
     if (attached) {
-      touchActivity();      // light the screen to show the charge state
       updatePowerLocks();   // hold awakeLock before re-enumerating
       usbReenumerate();
     }
@@ -906,7 +919,7 @@ void loop() {
   // that otherwise never gets captured at all.
   //
   // Full brightness is the proxy for "user is engaged": warm for
-  // DIM_AFTER_MS after real activity, released on dim.
+  // the profile's dimMs after real activity, released on dim.
   recorderSetMicWarm(bleLinkReady() && currentBrightness == BRIGHT_FULL);
 
   // 2 ms while recording (recorderTick drains the ring in one call, the
