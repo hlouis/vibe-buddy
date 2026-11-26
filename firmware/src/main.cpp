@@ -633,7 +633,13 @@ void setup() {
   // the mic's begin() then fails silently (DMA runs but delivers zeros).
   // We only need mic in phase 1, so disable speaker at board init time.
   cfg.internal_spk = false;
+  // 5V boost (Grove / Hat / IR power) off: nothing is attached, and an idle
+  // boost converter is a constant drain. M5Unified enables it by default.
+  cfg.output_power = false;
   M5.begin(cfg);
+  // Green status LED off: it hangs off M5PM1's LED_EN (PWR_CFG 0x06 bit4),
+  // which defaults high and would stay lit through deep sleep.
+  M5.In_I2C.bitOff(0x6E, 0x06, 1 << 4, 100000);
   M5.Lcd.setRotation(0);
   M5.Lcd.setBrightness(BRIGHT_FULL);
   currentBrightness = BRIGHT_FULL;
