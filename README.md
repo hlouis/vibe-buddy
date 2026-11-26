@@ -276,6 +276,8 @@ iOS 端关键标签：`[ble]` / `[stt]` / `[wv]`（WebView 注入）。模拟器
 
 锁全放开只是「允许睡」，能不能真睡着取决于唤醒频率。熄屏空闲时的唤醒源都被收住了：录音任务阻塞等通知、BLE 用 peripheral latency 跳过空闲连接事件、主循环靠按键中断唤醒（`idleWait()`）。新增任何周期性唤醒都会把 light sleep 切碎——改完看 `[pwr]` 的 `slp=` / `wk=`，判读方法见 [hardware-debug.md](docs/hardware-debug.md)「功耗测量」。
 
+即使睡得很好，连着 BLE 的 light sleep 仍有几十 mA，250 mAh 电池撑不过一晚。所以熄屏闲置 10 分钟后进 deep sleep（BLE 断开，按 A/B 唤醒即重启，主机自动重连，插 USB 时不进）。
+
 插着 USB 时屏幕同样按超时熄灭：StickS3 的系统负载直接从电池取电、充电电流又小，屏幕常亮加 240 MHz 会把充电电流吃光。
 
 ### 几处踩坑经验

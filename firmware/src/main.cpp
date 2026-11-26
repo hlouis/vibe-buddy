@@ -6,6 +6,7 @@
 #include <esp_sleep.h>
 #include <hal/gpio_ll.h>
 #include <soc/usb_serial_jtag_struct.h>
+#include <driver/rtc_io.h>
 #include <stdarg.h>
 #include "ble_bridge.h"
 #include "recorder.h"
@@ -587,6 +588,44 @@ static void idleWait() {
   }
 }
 
+// Long idle -> deep sleep. Light sleep with BLE connected still costs tens
+// of mA here (the ESP32 rails and the L3B rail stay powered), so a stick
+// left on a desk overnight goes flat. After DEEP_SLEEP_AFTER_MS with the
+// screen off and no activity, power down to deep sleep; a BtnA/BtnB press
+// wakes it through a full reboot, and the host reconnects on its own.
+// Not on USB: there is nothing to save, and it would drop the console.
+static constexpr uint32_t DEEP_SLEEP_AFTER_MS = 10UL * 60 * 1000;
+
+static void enterDeepSleep() {
+  Serial.println("[pm] idle -> deep sleep (BtnA/BtnB wakes)");
+  bleLogf("deep sleep: idle %u min", (unsigned)(DEEP_SLEEP_AFTER_MS / 60000));
+  delay(50);                          // let the log notify go out
+  M5.Lcd.sleep();                     // panel SLPIN
+  // L3B rail (LCD, mic, speaker amp) off: M5PM1 GPIO2 low. M5GFX drives it
+  // high again during the boot that the wake-up triggers.
+  M5.In_I2C.bitOff(0x6E, 0x11, 1 << 2, 100000);
+  // Buttons are active low; keep their pull-ups alive through deep sleep.
+  for (gpio_num_t pin : {BTN_A_PIN, BTN_B_PIN}) {
+    rtc_gpio_pullup_en(pin);
+    rtc_gpio_pulldown_dis(pin);
+  }
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+  // Light sleep leaves its wake sources armed: vApplicationSleep sets a
+  // timer wakeup before every entry, and idleWait() enables GPIO wakeup.
+  // A leftover timer turns deep sleep into a reboot a few seconds later
+  // (seen as reset=DEEPSLEEP wake=TIMER), so start from a clean slate.
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  esp_sleep_enable_ext1_wakeup((1ULL << BTN_A_PIN) | (1ULL << BTN_B_PIN),
+                               ESP_EXT1_WAKEUP_ANY_LOW);
+  esp_deep_sleep_start();
+}
+
+static bool deepSleepDue() {
+  return !g_usbPowered && !recorderActive() && currentBrightness == BRIGHT_OFF &&
+         millis() - lastActivityMs >= DEEP_SLEEP_AFTER_MS &&
+         gpio_get_level(BTN_A_PIN) && gpio_get_level(BTN_B_PIN);
+}
+
 void setup() {
   auto cfg = M5.config();
   // StickS3 routes both speaker and mic through the ES8311 codec on a
@@ -611,6 +650,10 @@ void setup() {
 
   buildDeviceName();
   Serial.printf("[boot] device name: %s\n", deviceName);
+  // reset 8 + wake 3 (EXT1) = woken by a button from deep sleep; any other
+  // wake cause after reset 8 means a stray wake source (see enterDeepSleep()).
+  Serial.printf("[pm] boot reset=%d wake=%d\n",
+                (int)esp_reset_reason(), (int)esp_sleep_get_wakeup_cause());
   initPowerManagement();
   bleInit(deviceName);
   recorderInit();
@@ -850,6 +893,7 @@ void loop() {
 
   updateBrightness();
   updatePowerLocks();
+  if (deepSleepDue()) enterDeepSleep();
   // Pre-warm the mic codec while the user is plausibly about to press
   // BtnA — i.e., screen is at full brightness AND the BLE link is
   // ready. Removes the ~100 ms cold-start gap, which is 100 ms of speech

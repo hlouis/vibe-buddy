@@ -282,6 +282,14 @@ esp_pm 给每个核建了一把内部 `CPU_FREQ_MAX` 锁（`pm_impl.c` 里的
 85–90%。≈67/s 说明每个 15 ms 连接事件都在醒（latency 没生效）；≈20/s
 说明主循环退回了 50 ms 轮询（`idleWait()` 没走到，或有按键被判为按住）。
 
+### 进了 deep sleep 却几秒后自己醒
+
+串口开机行 `[pm] boot reset=8 wake=4`：从 deep sleep 醒来，唤醒源是**定时器**。
+light sleep 每次入睡前 `vApplicationSleep` 都会设定时器唤醒，这个唤醒源不会自动
+清掉，带进 deep sleep 就几秒后重启。`enterDeepSleep()` 先
+`esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL)` 再只开按键唤醒；按键
+唤醒的正确读数是 `reset=8 wake=3`。
+
 ### 插着 USB 电压却不涨
 
 先看负载，不是先怀疑充电器：StickS3 的系统负载从电池节点取电，屏幕全亮 +
