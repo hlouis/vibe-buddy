@@ -94,6 +94,7 @@ CGEvent + 最长公共前缀 diff，按 partial 增量打字。`FocusGate.swift`
 - 固件侧 BLE 协商参数（MTU 517、DLE 251、conn interval 15ms）是端到端 <1s 延迟的前提；peripheral latency 30 是空闲省电的前提（不改变有数据时的延迟），见 `ble_bridge.cpp` 的 update_conn_params，详细 trade-off 在 README "BLE 协议要点" + "关键设计决策"。**2M PHY 是优化不是要求**——Opus 只要 ~20 kbps，1M 够用；真正制约录音的是 MTU（一帧必须装进一个 notify，`recorderLinkOk()` 是那个谓词）。
 - **Opus 编码有实测的时间预算**：一帧 60ms 音频要 19–22ms（240MHz / complexity 1，随内容波动），占实时的三分之一。因此录音全程必须锁 240MHz（`main.cpp` 的 `cpuLock` 在录音时持有；80MHz 下要 ~66ms 直接超预算）且 complexity 不能上调——破了会让编码慢于实时，`MAX_ENCODES_PER_TICK` 是最后一道闸。改 codec 参数或调频策略后回来看 `[rec] stopped` 里的 `enc=` 数字。
 - **固件开着 light sleep，唤醒频率决定功耗**：没有 esp_pm 锁时自动睡，需求只用 `cpuLock` / `awakeLock` 表达（`main.cpp` 的 `updatePowerLocks()`），不要直接调 `setCpuFrequencyMhz()`。熄屏空闲的唤醒源都已收住（录音任务等通知、BLE peripheral latency、按键中断唤醒的 `idleWait()`），任何新的周期性唤醒都会把睡眠切碎。改完拔线熄屏，看 BLE 日志里 `[pwr]` 的 `slp=` / `wk=`（判读见 `docs/hardware-debug.md`「功耗测量」）。
+- **StickS3 系统负载从电池节点取电，充电电流很小**：插 USB 时屏幕常亮 + 240 MHz 会吃光充电电流、电池不涨，所以插线时屏幕照样按超时熄灭。PMIC 是 M5PM1（I2C 0x6E，寄存器见 m5stack/M5PM1 的 `M5PM1.h`），不是 AXP2101。
 - **light sleep 会停掉 USB 枚举**：睡眠中插线主机会放弃枚举，固件靠检测 VBUS 后拉 D+ 逼主机重枚举（`usbReenumerate()`）。插着 USB 时 `awakeLock` 不放，串口和 `make fw-capture` 才可用。
 - **`loopTask` 默认栈 8KB**，`opus_encode()` 会捅穿 → `sdkconfig.defaults` 的 `CONFIG_ARDUINO_LOOP_STACK_SIZE`（`SET_LOOP_TASK_STACK_SIZE` 在 espidf 组件构建下无效）。任何要在 `loop()` 里调的重型库都得先想栈。
 - 提交规范看用户全局 CLAUDE.md（Conventional Commits，scope 用域名，描述中文，不要 Co-Author / Claude Code 字样，**不要主动 commit/push**）。

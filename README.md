@@ -45,7 +45,7 @@ vibe-buddy/
 
 **M5Stack StickS3**（SKU K150）
 - ESP32-S3-PICO-1-N8R8（8 MB flash + 8 MB OPI PSRAM，**PSRAM 我们不启用**——唯一想用它的是 32 KB 音频环形缓冲，内部 RAM 绰绰有余；八线 PSRAM 要常供电常时钟，会削弱 light sleep）
-- 1.14" LCD · MEMS mic 经 ES8311 codec · BMI270 · AXP2101 PMU
+- 1.14" LCD · MEMS mic 经 ES8311 codec · BMI270 · M5PM1 PMU · 250 mAh 电池
 - BLE 5.0（支持 2M PHY + DLE）
 
 固件屏幕右上角显示电量进度条 + 百分比数字，充电时叠加闪电图标。
@@ -275,6 +275,8 @@ iOS 端关键标签：`[ble]` / `[stt]` / `[wv]`（WebView 注入）。模拟器
 固件打开了 ESP-IDF 电源管理（`sdkconfig.defaults`）：没有任何 esp_pm 锁时自动 light sleep，BLE 射频在连接事件间断电。代码不直接调频，只用两把锁表达需求（`main.cpp` 的 `updatePowerLocks()`）：录音或屏幕全亮持有 `cpuLock`（240 MHz，同时阻止睡眠），背光亮或插着 USB 持有 `awakeLock`。
 
 锁全放开只是「允许睡」，能不能真睡着取决于唤醒频率。熄屏空闲时的唤醒源都被收住了：录音任务阻塞等通知、BLE 用 peripheral latency 跳过空闲连接事件、主循环靠按键中断唤醒（`idleWait()`）。新增任何周期性唤醒都会把 light sleep 切碎——改完看 `[pwr]` 的 `slp=` / `wk=`，判读方法见 [hardware-debug.md](docs/hardware-debug.md)「功耗测量」。
+
+插着 USB 时屏幕同样按超时熄灭：StickS3 的系统负载直接从电池取电、充电电流又小，屏幕常亮加 240 MHz 会把充电电流吃光。
 
 ### 几处踩坑经验
 

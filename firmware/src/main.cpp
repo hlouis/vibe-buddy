@@ -75,9 +75,12 @@ static bool     prevCharging = false;
 // Backlight power management. The LCD + backlight is the single largest
 // idle drain on StickS3. We hold full brightness while the user is
 // active, drop to a dim "still readable" level after DIM_AFTER_MS, and
-// fully off after OFF_AFTER_MS. On USB power we never dim — the user is
-// plausibly looking at the device for the charge state, and there's no
-// battery to save.
+// fully off after OFF_AFTER_MS — on USB too. StickS3 draws the system
+// load from the battery node and the charger's current is small, so a lit
+// screen at 240 MHz with a warm codec eats the whole charge current and
+// the battery stays flat while plugged in (measured: voltage falling on
+// USB with the screen on, rising with it off). Plugging in counts as
+// activity, so the screen still lights up to show the charge state.
 //
 // "Activity" = button press, BLE connect/disconnect, or recorder start.
 // It deliberately does NOT include front_app pushes from the host: see
@@ -99,21 +102,11 @@ static void applyBrightness(uint8_t target) {
 }
 
 static void updateBrightness() {
+  uint32_t idle = millis() - lastActivityMs;
   uint8_t target;
-  // Keyed on USB presence, NOT isCharging(). With a full battery on USB
-  // the charger cycles on and off every few seconds, and this rule used
-  // to follow it: screen strobed full/off, CPU strobed 240/80, and the
-  // ES8311 warmed and tore down on each flip. VBUS is the signal this
-  // rule always meant — "it's plugged in, the user may be looking at the
-  // charge state" — and it doesn't move until the cable does.
-  if (g_usbPowered) {
-    target = BRIGHT_FULL;
-  } else {
-    uint32_t idle = millis() - lastActivityMs;
-    if      (idle < DIM_AFTER_MS) target = BRIGHT_FULL;
-    else if (idle < OFF_AFTER_MS) target = BRIGHT_DIM;
-    else                          target = BRIGHT_OFF;
-  }
+  if      (idle < DIM_AFTER_MS) target = BRIGHT_FULL;
+  else if (idle < OFF_AFTER_MS) target = BRIGHT_DIM;
+  else                          target = BRIGHT_OFF;
   applyBrightness(target);
 }
 
@@ -217,9 +210,8 @@ static void updatePowerLocks() {
   holdLock(awakeLock, awakeLockHeld, wantAwake(), "awake");
 }
 
-// Power profiling tick — 1 s cadence. AXP2101 on StickS3 does not expose
-// a battery-current ADC (M5Unified's getBatteryCurrent() is a stub that
-// returns 0 for this PMIC), so we derive a power proxy from the slope of
+// Power profiling tick — 1 s cadence. StickS3's PMIC (M5PM1) exposes no
+// battery-current reading, so we derive a power proxy from the slope of
 // the battery voltage over a sliding window. mV/min is monotonic in
 // average current draw and is all we need to A/B different configs.
 static constexpr uint32_t POWER_LOG_MS = 1000;
@@ -750,14 +742,14 @@ void loop() {
     if (lvl > 100) lvl = 100;
     g_battery = (uint8_t)lvl;
     g_charging = M5.Power.isCharging();
-    // VBUS is only exposed on AXP192/AXP2101 boards; StickS3 is AXP2101.
-    // -1 means the model doesn't support it, in which case fall back to
-    // isCharging() and accept the flapping rather than never dimming.
+    // VBUS as read by M5PM1. -1 means the PMIC can't report it, in which
+    // case fall back to isCharging(), which flaps while charging.
     int16_t vbus = M5.Power.getVBUSVoltage();
     bool usb = (vbus < 0) ? g_charging : (vbus > 4000);
     bool attached = usb && !g_usbPowered;
     g_usbPowered = usb;
     if (attached) {
+      touchActivity();      // light the screen to show the charge state
       updatePowerLocks();   // hold awakeLock before re-enumerating
       usbReenumerate();
     }
@@ -863,12 +855,8 @@ void loop() {
   // ready. Removes the ~100 ms cold-start gap, which is 100 ms of speech
   // that otherwise never gets captured at all.
   //
-  // Full brightness is a proxy for "user is engaged", and since
-  // updateBrightness() pins FULL on USB, that proxy is permanently true
-  // while plugged in — so the codec stays warm rather than being
-  // released on dim. Deliberate: there's no battery to protect on wall
-  // power, and it buys back the first 100 ms on every press. On battery
-  // the old behavior stands, warm for DIM_AFTER_MS after real activity.
+  // Full brightness is the proxy for "user is engaged": warm for
+  // DIM_AFTER_MS after real activity, released on dim.
   recorderSetMicWarm(bleLinkReady() && currentBrightness == BRIGHT_FULL);
 
   // 2 ms while recording (recorderTick drains the ring in one call, the
