@@ -47,6 +47,8 @@ targets:
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.utilities"
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
         INFOPLIST_KEY_NSPrincipalClass: NSApplication
+        # Menu-bar agent: no Dock icon / Cmd+Tab entry. See AppDelegate.
+        INFOPLIST_KEY_LSUIElement: YES
         INFOPLIST_KEY_LSMinimumSystemVersion: "14.0"
         # Disable sandbox during dev so Bluetooth works without extra entitlements.
         # When we ship we'll opt back in with com.apple.security.device.bluetooth.

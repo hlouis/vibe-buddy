@@ -313,15 +313,9 @@ struct ContentView: View {
         }
     }
 
-    // SwiftUI doesn't expose a typed "open Settings scene" API on
-    // macOS 14 — the cross-version trick is to send the standard
-    // "showSettingsWindow:" Cocoa selector, which the Settings { }
-    // scene installs as the Cmd+, action.
+    // Handled by AppDelegate.showSettings, the last stop of the
+    // responder chain.
     private func openSettingsWindow() {
-        if #available(macOS 14, *) {
-            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        } else {
-            NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-        }
+        NSApp.sendAction(#selector(AppDelegate.showSettings(_:)), to: nil, from: nil)
     }
 }

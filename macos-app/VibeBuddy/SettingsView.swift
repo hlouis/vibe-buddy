@@ -2,8 +2,8 @@ import SwiftUI
 import AppKit
 import VibeBuddyCore
 
-// Standard macOS Settings window (Cmd+,). Single tab for now: Doubao
-// API credentials. Writes ~/.config/vibe-buddy/config.json — the same
+// Settings window (Cmd+, or the status item menu, see AppDelegate).
+// Doubao API credentials. Writes ~/.config/vibe-buddy/config.json — the same
 // file the app already reads on every PTT session start, so changes
 // take effect on the next recording without an app restart.
 //
